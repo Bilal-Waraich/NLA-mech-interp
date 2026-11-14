@@ -3,12 +3,14 @@
 __pycache__/
 *.pyc
 .venv/
+.venv
+.venv.nosync/
 *.safetensors
 *.pt
 *.npz
 /archive/
-# Downloaded datasets / label files (local only)
 /data/
 
-# macOS
 .DS_Store
+
+/results/
