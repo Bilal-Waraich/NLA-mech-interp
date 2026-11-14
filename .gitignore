@@ -1,0 +1,14 @@
+/docs/
+/.claude/
+__pycache__/
+*.pyc
+.venv/
+*.safetensors
+*.pt
+*.npz
+/archive/
+# Downloaded datasets / label files (local only)
+/data/
+
+# macOS
+.DS_Store
