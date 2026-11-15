@@ -79,21 +79,26 @@ def train_batchtopk(data: dict[str, np.ndarray], cfg: TrainConfig, device: str =
         z = torch.zeros_like(pre.flatten()).scatter(-1, top.indices, top.values).view_as(pre)
         x_hat = z @ params["W_dec"] + params["b_dec"]
 
+        # All tensors below keep fixed shapes. Data-dependent shapes (boolean indexing such as
+        # pre[:, dead]) make the MPS backend compile and cache a new graph for every distinct number
+        # of dead latents, which leaked ~50 MB/min of host memory in the first run.
         with torch.no_grad():
             fired = z.sum(0) > 0
-            inactive += (~fired).float()
-            inactive[fired] = 0
+            inactive = torch.where(fired, torch.zeros_like(inactive), inactive + 1)
         l2 = (x_hat - x).pow(2).mean()
         l1 = cfg.l1_coeff * z.abs().sum(-1).mean()
         aux = torch.zeros((), device=dev)
         dead = inactive >= cfg.n_batches_to_dead
-        if dead.any():
-            k_aux = min(cfg.d_model // 2, int(dead.sum()))
-            scale = min(int(dead.sum()) / (cfg.d_model // 2), 1.0)
-            pre_dead = pre[:, dead]
+        n_dead = int(dead.sum())
+        if n_dead > 0:
+            k_aux = cfg.d_model // 2
+            scale = min(n_dead / k_aux, 1.0)
+            # Mask instead of slice: non-dead latents become 0, so when fewer than k_aux latents are
+            # dead the extra selected entries are zeros and contribute nothing (same result as slicing).
+            pre_dead = pre * dead.to(pre.dtype)
             t = torch.topk(pre_dead, k_aux, dim=-1)
             z_aux = torch.zeros_like(pre_dead).scatter(-1, t.indices, t.values)
-            aux = cfg.aux_penalty * scale * (z_aux @ params["W_dec"][dead] - (x - x_hat).detach()).pow(2).mean()
+            aux = cfg.aux_penalty * scale * (z_aux @ params["W_dec"] - (x - x_hat).detach()).pow(2).mean()
         loss = l2 + l1 + aux
 
         opt.zero_grad(set_to_none=True)
