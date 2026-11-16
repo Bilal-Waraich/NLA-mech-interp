@@ -52,3 +52,23 @@ def test_rule_on_synthetic_table() -> None:
                        label_datasets=names)
     assert table.loc[0, "label_consistent"] and table.loc[0, "label_direction"] == "+"
     assert not table.loc[1, "active_all"]
+
+
+def test_rule_v1_on_synthetic_table() -> None:
+    from medinterp.eval.metrics import apply_rule_v1, latent_table_v1
+    rng = np.random.default_rng(2)
+    names, n = ["a", "b"], 600
+    codes, opacity, groups = {}, {}, {}
+    for d in names:
+        lab = np.where(rng.random(n) < 0.5, 1.0, 0.0)
+        lab[:50] = np.nan                                   # left out of the contrast
+        z = np.zeros((n, 3), dtype=np.float16)
+        z[:, 0] = (lab == 1) * 2.0 + rng.random(n)          # label latent, present everywhere
+        z[:, 1] = rng.random(n) + (3.0 if d == "a" else 0)  # dataset latent
+        z[:, 2] = rng.random(n)                             # noise
+        codes[d], opacity[d], groups[d] = z, lab, np.repeat(np.arange(n // 2), 2).astype(str)
+    t = apply_rule_v1(latent_table_v1(codes, opacity, groups), names, names, tau=0.05,
+                      dsauc_band=(0.35, 0.65), fdr=0.05)
+    assert t.loc[0, "label_consistent"] and t.loc[0, "label_direction"] == "+"
+    assert t.loc[1, "active_all"] and not t.loc[1, "cross_dataset"]   # identifies its dataset
+    assert t.loc[2, "cross_dataset"] and not t.loc[2, "label_consistent"]

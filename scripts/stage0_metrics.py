@@ -4,8 +4,18 @@
   2. sparse probing (k = 1, 5, 10, 50 latents chosen on the source dataset) with cross-dataset transfer
   3. null-adjusted monosemanticity on CheXpert finding sets (Wesp et al. 2026 style)
 
-Outputs in results/stage0/: recon.csv, probe_transfer.csv, selectivity_<dictionary>.csv,
-metrics_summary.json. Run: ~/.venvs/nla-mech-interp/bin/python scripts/stage0_metrics.py
+--protocol thesis (default): run 2 unchanged. Outputs in results/stage0/: recon.csv, probe_transfer.csv,
+selectivity_<dictionary>.csv, metrics_summary.json.
+
+--protocol v1 (protocol sections 3, 4, 10): grouped split file; ridge decoder, PCA and probes fitted on
+train images; FVE with each dictionary's own decoder next to the ridge refit (P1.1); probes with
+regularisation tuned on val and the same pooling for codes and the dense reference (P1.2); selectivity
+with uncertain CheXpert labels excluded per label and one "normal" column; cluster-bootstrap intervals and
+complete separation of trained seeds against the nulls. Outputs in results/stage0_v1/metrics/:
+results.csv (tidy), recon.csv, probe_transfer.csv, selectivity_<dictionary>.csv, summary.json,
+config.json, run.log.
+
+Run: ~/.venvs/nla-mech-interp/bin/python scripts/stage0_metrics.py [--protocol thesis|v1] [--out DIR]
 """
 from __future__ import annotations
 
@@ -32,7 +42,8 @@ from medinterp.eval.probing import fit_eval, sparse_probe_transfer
 from medinterp.eval.recon import FVEAccumulator, RidgeAccumulator, predict, split_images
 from medinterp.eval.selectivity import monosemanticity
 
-OUT = Path(__file__).resolve().parents[1] / "results/stage0"
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "results/stage0"
 SEED = 0
 TEST_FRAC = 0.2
 RECON_TRAIN_IMAGES, RECON_TEST_IMAGES = 600, 200   # per dataset
@@ -40,8 +51,15 @@ PROBE_KS = (1, 5, 10, 50)
 SELECTIVITY_QUANTILE = 0.95
 
 
+LOG_FILES: list = []   # v1 also writes the log into its run directory
+
+
 def log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    for f in LOG_FILES:
+        f.write(line + "\n")
+        f.flush()
 
 
 def setup(acts: ArchivedActivations):
@@ -99,7 +117,7 @@ def score_dictionary(acts, enc, info, d_model):
     return image_codes, pooled, fve.fve(), native
 
 
-def main() -> None:
+def main_thesis(OUT: Path) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     acts = ArchivedActivations()
     info, findings = setup(acts)
@@ -170,5 +188,210 @@ def main() -> None:
     log("done")
 
 
+# ---------------------------------------------------------------- protocol v1
+
+V1_PROBE_MS = (1, 5, 10, 50)
+V1_PRIMARY_MS = (1, 5)            # P1.2
+V1_N_BOOT, V1_CONFIDENCE = 2000, 0.95
+V1_RANDOM_SEEDS = [0, 1, 2, 3, 4]
+V1_FINDINGS = [c for c in CHEXPERT_LABELS]       # "No Finding" is the single normal column
+
+
+def v1_score_dictionary(ctx, enc, recon_train: dict, eval_masks: dict, pooling: str, d_model: int):
+    """One pass: pooled image codes, ridge statistics on the train sample, and per-image errors of the
+    own decoder on the evaluation images. A second pass scores the ridge refit on the same images."""
+    from medinterp.eval.recon import PerImageRecon
+    n_lat, P = enc.d_sae, ctx.acts.n_patches
+    codes, ridge, own = {}, RidgeAccumulator(n_lat, d_model), PerImageRecon()
+    has_decoder = hasattr(enc, "decode")
+    for d, block in ctx.acts.blocks.items():
+        codes[d] = np.zeros((block.n_images, n_lat), dtype=np.float16)
+        for img0, x in ctx.acts.iter_token_chunks(d, 256):
+            n_img = x.shape[0] // P
+            z = enc.encode(x)
+            zi = z.view(n_img, P, -1)
+            codes[d][img0:img0 + n_img] = (zi.amax(1) if pooling == "max" else zi.mean(1)).numpy()
+            local = np.arange(img0, img0 + n_img)
+            sel = np.flatnonzero(recon_train[d][local])
+            if sel.size:
+                rows = torch.from_numpy((sel[:, None] * P + np.arange(P)).ravel())
+                ridge.add(z[rows], x[rows])
+            ev = np.flatnonzero(eval_masks[d][local])
+            if ev.size and has_decoder:
+                rows = torch.from_numpy((ev[:, None] * P + np.arange(P)).ravel())
+                own.add(x[rows], enc.decode(z[rows]), P)
+    W = ridge.solve()
+    refit = PerImageRecon()
+    for d in ctx.acts.blocks:
+        for img0, x in ctx.acts.iter_token_chunks(d, 256):
+            n_img = x.shape[0] // P
+            ev = np.flatnonzero(eval_masks[d][np.arange(img0, img0 + n_img)])
+            if ev.size:
+                rows = torch.from_numpy((ev[:, None] * P + np.arange(P)).ravel())
+                refit.add(x[rows], predict(W, enc.encode(x[rows])), P)
+    return codes, (own if has_decoder else None), refit
+
+
+def v1_pooled_activations(ctx, pooling: str) -> dict[str, np.ndarray]:
+    out = {}
+    for d, block in ctx.acts.blocks.items():
+        out[d] = np.zeros((block.n_images, ctx.acts.d_model), dtype=np.float32)
+        for img0, x in ctx.acts.iter_token_chunks(d, 256):
+            n_img = x.shape[0] // ctx.acts.n_patches
+            xi = x.view(n_img, ctx.acts.n_patches, -1)
+            out[d][img0:img0 + n_img] = (xi.amax(1) if pooling == "max" else xi.mean(1)).numpy()
+    return out
+
+
+def main_v1(args) -> None:
+    from medinterp.data.manifests import DEFAULT_LABEL_DIR
+    from medinterp.eval.probing import eval_images, mean_cross_auroc_statistic, sparse_probe_transfer_tuned
+    from medinterp.eval.stats import cluster_bootstrap, complete_separation
+    from medinterp.runinfo import write_config
+    from medinterp.stage0_v1 import TIDY_COLUMNS, load_context, null_specs, parse_sae_args, tidy_row, trained_spec
+
+    out = args.out
+    if (out / "summary.json").exists() and not args.force:
+        log(f"{out / 'summary.json'} exists; nothing to do (use --force to recompute)")
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    LOG_FILES.append(open(out / "run.log", "a"))
+    ctx = load_context(DEFAULT_RUN_DIR, DEFAULT_LABEL_DIR, args.split_file)
+    names, d_model, ev_split = list(ctx.acts.blocks), ctx.acts.d_model, args.eval_split
+    saes = parse_sae_args(args.sae) or {f"seed{s}": ROOT / f"results/stage0/sae_seeds/seed{s}" for s in (0, 1, 2)}
+    specs = [trained_spec(n, p, args.sae_fit_split) for n, p in saes.items()]
+    k, d_sae = specs[0].meta["k"], specs[0].meta["d_sae"]
+    specs += null_specs(ctx, d_sae, k, V1_RANDOM_SEEDS, 50_000, seed=SEED)
+
+    # Ridge decoder fitted on a seeded sample of train images; FVE on every image of the eval split.
+    rng = np.random.default_rng(SEED)
+    recon_train = {}
+    for d in names:
+        idx = np.flatnonzero(ctx.masks[d]["train"])
+        pick = rng.choice(idx, min(RECON_TRAIN_IMAGES, idx.size), replace=False)
+        recon_train[d] = np.isin(np.arange(len(ctx.masks[d]["train"])), pick)
+    eval_all = {d: ctx.masks[d][ev_split] for d in names}
+    recon_groups = np.concatenate([ctx.groups[d][eval_all[d]] for d in names])
+    labels = {d: ctx.opacity[d] for d in names}
+    probe_masks = eval_images(labels, ctx.masks, ev_split)
+    probe_groups = np.concatenate([ctx.groups[d][probe_masks[d]] for d in names])
+
+    chex = ctx.manifests["chexpert"]
+    sel_imgs = ctx.masks["chexpert"][ev_split]
+    raw = chex[V1_FINDINGS].to_numpy()[sel_imgs]
+    findings, known = raw == 1, raw != -1          # NaN = not mentioned = a certain negative
+
+    settings = {"protocol": "v1", "eval_split": ev_split, "pooling": args.pooling, "probe_ms": V1_PROBE_MS,
+                "n_bootstrap": V1_N_BOOT, "confidence": V1_CONFIDENCE, "recon_train_images": RECON_TRAIN_IMAGES,
+                "seed": SEED, "centring": "archive (per-dataset, all images; as the SAEs were trained)",
+                "dictionaries": {s.name: s.meta for s in specs}}
+    write_config(out, settings, ROOT, args.split_file)
+    boot = lambda stat, groups: cluster_bootstrap(stat, groups, V1_N_BOOT, V1_CONFIDENCE, seed=SEED)
+
+    tidy, recon_rows, probe_rows, summary = [], [], [], {"settings": settings, "dictionaries": {}}
+    # Bootstrap samples share the resamples across dictionaries (same groups, same seed): paired differences.
+    samples, points = {}, {}
+
+    def probe_block(spec_like, feats, m_list, rank_all=False):
+        rows = sparse_probe_transfer_tuned(feats, labels, ctx.masks, m_list, ev_split, keep_scores=True,
+                                           rank_all=rank_all)
+        res = {}
+        for m in (m_list if rank_all else V1_PRIMARY_MS):
+            b = boot(mean_cross_auroc_statistic(rows, m, labels, probe_masks), probe_groups)
+            res[m] = b
+            tidy.append(tidy_row(spec_like, "probe_mean_cross_auroc", f"m={m}", ev_split, b.estimate, b.ci_low, b.ci_high))
+        for r in rows:
+            probe_rows.append({"dictionary": spec_like.name, **{c: r[c] for c in ("source", "m", "target", "auroc", "C")}})
+        return res
+
+    for spec in specs:
+        log(f"{spec.name}: encode, reconstruction")
+        codes, own, refit = v1_score_dictionary(ctx, spec.build(), recon_train, eval_all, args.pooling, d_model)
+        row = {"fit_split": spec.meta.get("fit_split")}
+        for label, acc in (("fve_own_decoder", own), ("fve_ridge_refit", refit)):
+            if acc is None:
+                continue
+            b = boot(acc.fve, recon_groups)
+            samples[(spec.name, label)], points[(spec.name, label)] = b.samples, b.estimate
+            row[label] = [b.estimate, b.ci_low, b.ci_high]
+            tidy.append(tidy_row(spec, label, "all", ev_split, b.estimate, b.ci_low, b.ci_high))
+        recon_rows.append({"dictionary": spec.name, **{k_: v[0] for k_, v in row.items() if isinstance(v, list)}})
+        log(f"{spec.name}: probes")
+        for m, b in probe_block(spec, codes, V1_PROBE_MS).items():
+            samples[(spec.name, f"probe_m{m}")], points[(spec.name, f"probe_m{m}")] = b.samples, b.estimate
+            row[f"probe_mean_cross_auroc_m{m}"] = [b.estimate, b.ci_low, b.ci_high]
+        log(f"{spec.name}: selectivity")
+        sel = monosemanticity(codes["chexpert"][sel_imgs], findings, top_n=10, seed=SEED, known=known)
+        st = pd.DataFrame(sel, columns=["coherence", "specificity", "mono"]).assign(latent=np.arange(len(sel)))
+        st.to_csv(out / f"selectivity_{spec.name}.csv", index=False)
+        mono = st.mono.dropna().sort_values(ascending=False)
+        row["selectivity"] = {"n_scored": int(mono.size), "top10_mean": float(mono.head(10).mean()),
+                              "median": float(mono.median())}
+        tidy.append(tidy_row(spec, "selectivity_top10_mean", "chexpert", ev_split, row["selectivity"]["top10_mean"]))
+        summary["dictionaries"][spec.name] = row
+        log(f"{spec.name}: {row}")
+        del codes
+
+    log("dense reference")
+    from medinterp.stage0_v1 import DictionarySpec
+    dense = DictionarySpec("dense_pooled", "dense", lambda: None, {"d_sae": d_model, "k": None, "steps": 0})
+    db = probe_block(dense, v1_pooled_activations(ctx, args.pooling), (d_model,), rank_all=True)
+    summary["dense_reference"] = {f"probe_mean_cross_auroc_m{d_model}": [db[d_model].estimate, db[d_model].ci_low,
+                                                                        db[d_model].ci_high]}
+
+    # Trained seeds against every null: complete separation and the paired difference to the best null.
+    trained = [s.name for s in specs if s.kind == "trained"]
+    nulls = [s.name for s in specs if s.kind != "trained"]
+    comparisons = {}
+    for metric in ["fve_own_decoder", "fve_ridge_refit"] + [f"probe_m{m}" for m in V1_PRIMARY_MS]:
+        have_null = [n for n in nulls if (n, metric) in samples]
+        if not have_null:
+            continue
+        point = {n: points[(n, metric)] for n in trained + have_null}
+        sep = complete_separation([point[n] for n in trained], [point[n] for n in have_null])
+        best_null = max(have_null, key=lambda n: point[n])
+        diffs = {}
+        for t in trained:
+            d = samples[(t, metric)] - samples[(best_null, metric)]
+            lo, hi = np.quantile(d, [(1 - V1_CONFIDENCE) / 2, 1 - (1 - V1_CONFIDENCE) / 2])
+            diffs[t] = [point[t] - point[best_null], float(lo), float(hi)]
+        comparisons[metric] = {"separated": sep.separated, "gap": sep.gap, "p_exact": sep.p_value,
+                               "n_trained": len(trained), "n_null": len(have_null), "best_null": best_null,
+                               "difference_to_best_null": diffs}
+        log(f"{metric}: {comparisons[metric]}")
+    summary["trained_vs_null"] = comparisons
+
+    pd.DataFrame(recon_rows).to_csv(out / "recon.csv", index=False)
+    pd.DataFrame(probe_rows).to_csv(out / "probe_transfer.csv", index=False)
+    pd.DataFrame(tidy, columns=TIDY_COLUMNS).to_csv(out / "results.csv", index=False)
+    (out / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+    log(f"wrote {out}")
+
+
+def parse_args():
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--protocol", choices=("thesis", "v1"), default="thesis")
+    ap.add_argument("--out", type=Path, help="output directory (default: results/stage0 or results/stage0_v1/metrics)")
+    ap.add_argument("--split-file", type=Path, default=ROOT / "data/splits/v1.csv")
+    ap.add_argument("--eval-split", choices=("val", "test"), default="val",
+                    help="v1: split for reported numbers; test only in a final evaluation")
+    ap.add_argument("--pooling", choices=("max", "mean"), default="max",
+                    help="v1: pooling of codes and of the dense reference (the same on both sides)")
+    ap.add_argument("--sae", action="append", default=[], metavar="NAME=PATH",
+                    help="v1: trained SAE checkpoint directory (repeatable; default: Stage 0.6 seeds 0-2)")
+    ap.add_argument("--sae-fit-split", default="all",
+                    help="v1: images the given SAEs were fitted on, if their cfg.json does not say")
+    ap.add_argument("--force", action="store_true", help="v1: recompute even if summary.json exists")
+    args = ap.parse_args()
+    if args.out is None:
+        args.out = OUT if args.protocol == "thesis" else ROOT / f"results/stage0_v1/metrics_{args.pooling}"
+    return args
+
+
 if __name__ == "__main__":
-    main()
+    _args = parse_args()
+    if _args.protocol == "thesis":
+        main_thesis(_args.out)
+    else:
+        main_v1(_args)

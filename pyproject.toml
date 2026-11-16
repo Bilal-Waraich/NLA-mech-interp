@@ -15,6 +15,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# Reference implementations used by tests only (eval/stats.py is checked against them).
+stats = ["statsmodels>=0.14"]
 
 [build-system]
 requires = ["hatchling"]

@@ -1,11 +1,17 @@
 """Stage 0: score the archived UMedPT SAE and baseline dictionaries under one rule.
 
-Outputs (results/stage0/):
+--protocol thesis (default): the rule of run 1, unchanged. Outputs (results/stage0/):
   latents_<dictionary>.csv   one row per latent: firing rates, dataset AUROCs, label AUROCs, decisions
   summary.json               counts per dictionary, thresholds, settings
   codes_trained_step200k.npz cached image-level codes of the trained SAE (reused by later stages)
 
-Run:  ~/.venvs/nla-mech-interp/bin/python scripts/stage0_baseline.py
+--protocol v1: the protocol's rule (sections 2-4): grouped splits, opacity labels, a fixed dataset-identity
+band instead of a threshold calibrated on random SAEs, per-group Mann-Whitney tests with
+Benjamini-Hochberg instead of Hanley-McNeil, latents chosen on val, PCA fitted on train tokens, and the
+effect sizes of passing latents reported on --eval-split. Outputs (results/stage0_v1/baseline/):
+  latents_<dictionary>.csv, summary.json, results.csv (tidy), config.json, run.log
+
+Run:  ~/.venvs/nla-mech-interp/bin/python scripts/stage0_baseline.py [--protocol thesis|v1] [--out DIR]
 """
 from __future__ import annotations
 
@@ -31,7 +37,8 @@ from medinterp.dictionaries.sae import TopKSAE
 from medinterp.eval.image_codes import image_max_codes
 from medinterp.eval.metrics import apply_rule, latent_table
 
-OUT = Path(__file__).resolve().parents[1] / "results/stage0"
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "results/stage0"
 TAU = 0.05                      # min fraction of images a latent must fire on, in every dataset
 DSAUC_QUANTILE = 0.95           # dataset-identity threshold = this quantile of random-SAE latents
 RANDOM_SEEDS = [0, 1, 2, 3, 4]
@@ -42,8 +49,15 @@ LABEL_SETS = {
 }
 
 
+LOG_FILES: list = []   # v1 also writes the log into its run directory
+
+
 def log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    for f in LOG_FILES:
+        f.write(line + "\n")
+        f.flush()
 
 
 def pca_sample(acts: ArchivedActivations, per_dataset: int, seed: int = 0) -> torch.Tensor:
@@ -58,7 +72,7 @@ def pca_sample(acts: ArchivedActivations, per_dataset: int, seed: int = 0) -> to
     return torch.cat(parts)
 
 
-def main() -> None:
+def main_thesis(OUT: Path) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     acts = ArchivedActivations()
     names = list(acts.blocks)
@@ -117,5 +131,93 @@ def main() -> None:
     log(f"wrote {OUT}")
 
 
+# ---------------------------------------------------------------- protocol v1
+
+# Values fixed by docs/eval-protocol.md section 3 (dataset band, FDR); tau and the null set as in run 1.
+V1_DSAUC_BAND = (0.35, 0.65)
+V1_FDR = 0.05
+V1_LABEL_DATASETS = ["chexpert", "rsna", "siim_covid"]
+
+
+def main_v1(args) -> None:
+    from medinterp.data.manifests import DEFAULT_LABEL_DIR
+    from medinterp.runinfo import write_config
+    from medinterp.stage0_v1 import (TIDY_COLUMNS, load_context, null_specs, parse_sae_args, subset,
+                                     tidy_row, trained_spec)
+    from medinterp.eval.metrics import apply_rule_v1, latent_table_v1
+
+    out = args.out
+    if (out / "summary.json").exists() and not args.force:
+        log(f"{out / 'summary.json'} exists; nothing to do (use --force to recompute)")
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    LOG_FILES.append(open(out / "run.log", "a"))
+    ctx = load_context(DEFAULT_RUN_DIR, DEFAULT_LABEL_DIR, args.split_file)
+    names = list(ctx.acts.blocks)
+    saes = parse_sae_args(args.sae) or {f"seed{s}": ROOT / f"results/stage0/sae_seeds/seed{s}" for s in (0, 1, 2)}
+    specs = [trained_spec(n, p, args.sae_fit_split) for n, p in saes.items()]
+    k, d_sae = specs[0].meta["k"], specs[0].meta["d_sae"]
+    specs += null_specs(ctx, d_sae, k, RANDOM_SEEDS, PCA_TOKENS_PER_DATASET, seed=0)
+    settings = {"protocol": "v1", "tau": TAU, "dsauc_band": V1_DSAUC_BAND, "fdr": V1_FDR,
+                "label_datasets": V1_LABEL_DATASETS, "select_split": "val", "eval_split": args.eval_split,
+                "pooling": "max", "centring": "archive (per-dataset, all images; as the SAEs were trained)",
+                "dictionaries": {s.name: s.meta for s in specs}}
+    write_config(out, settings, ROOT, args.split_file)
+
+    summary, tidy = {"settings": settings, "dictionaries": {}}, []
+    for spec in specs:
+        log(f"{spec.name}: encoding")
+        codes = image_max_codes(ctx.acts, spec.build())
+        sel = latent_table_v1(subset(codes, ctx.masks, "val"), subset(ctx.opacity, ctx.masks, "val"),
+                              subset(ctx.groups, ctx.masks, "val"))
+        t = apply_rule_v1(sel, names, V1_LABEL_DATASETS, TAU, V1_DSAUC_BAND, V1_FDR)
+        # Effect sizes on the evaluation split, for the latents selected on val.
+        ev = latent_table_v1(subset(codes, ctx.masks, args.eval_split),
+                             subset(ctx.opacity, ctx.masks, args.eval_split),
+                             subset(ctx.groups, ctx.masks, args.eval_split))
+        for d in V1_LABEL_DATASETS:
+            t[f"lauc_{d}_{args.eval_split}"] = ev[f"lauc_{d}"]
+        t.to_csv(out / f"latents_{spec.name}.csv", index=False)
+        passing = t[t.label_consistent]
+        eff = np.min([np.abs(passing[f"lauc_{d}_{args.eval_split}"] - 0.5) for d in V1_LABEL_DATASETS], axis=0) \
+            if len(passing) else np.array([])
+        row = {"n_latents": len(t), "active_all": int(t.active_all.sum()), "cross_dataset": int(t.cross_dataset.sum()),
+               "label_consistent": int(t.label_consistent.sum()),
+               "label_consistent_pos": int((t.label_consistent & (t.label_direction == "+")).sum()),
+               f"consistent_effect_{args.eval_split}_median": float(np.median(eff)) if eff.size else None,
+               f"consistent_effect_{args.eval_split}_max": float(eff.max()) if eff.size else None}
+        summary["dictionaries"][spec.name] = row
+        for metric in ("active_all", "cross_dataset", "label_consistent"):
+            tidy.append(tidy_row(spec, f"count_{metric}", "all", "val", row[metric]))
+        log(f"{spec.name}: {row}")
+        del codes
+    pd.DataFrame(tidy, columns=TIDY_COLUMNS).to_csv(out / "results.csv", index=False)
+    (out / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+    log(f"wrote {out}")
+
+
+def parse_args():
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--protocol", choices=("thesis", "v1"), default="thesis")
+    ap.add_argument("--out", type=Path, help="output directory (default: results/stage0 or results/stage0_v1/baseline)")
+    ap.add_argument("--split-file", type=Path, default=ROOT / "data/splits/v1.csv")
+    ap.add_argument("--eval-split", choices=("val", "test"), default="val",
+                    help="v1: split for reported effect sizes; test only in a final evaluation")
+    ap.add_argument("--sae", action="append", default=[], metavar="NAME=PATH",
+                    help="v1: trained SAE checkpoint directory (repeatable; default: Stage 0.6 seeds 0-2)")
+    ap.add_argument("--sae-fit-split", default="all",
+                    help="v1: images the given SAEs were fitted on, if their cfg.json does not say")
+    ap.add_argument("--force", action="store_true", help="v1: recompute even if summary.json exists")
+    args = ap.parse_args()
+    if args.out is None:
+        args.out = OUT if args.protocol == "thesis" else ROOT / "results/stage0_v1/baseline"
+    return args
+
+
 if __name__ == "__main__":
-    main()
+    _args = parse_args()
+    if _args.protocol == "thesis":
+        main_thesis(_args.out)
+    else:
+        main_v1(_args)

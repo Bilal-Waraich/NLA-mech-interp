@@ -89,3 +89,65 @@ def apply_rule(table: pd.DataFrame, datasets: list[str], tau: float, dsauc_thres
     t["label_consistent"] = t.cross_dataset & (sig_pos | sig_neg)
     t["label_direction"] = np.where(sig_pos, "+", np.where(sig_neg, "-", ""))
     return t
+
+
+# ---------------------------------------------------------------- protocol v1 (sections 3 and 4)
+
+def latent_table_v1(codes: dict[str, np.ndarray], opacity: dict[str, np.ndarray],
+                    groups: dict[str, np.ndarray]) -> pd.DataFrame:
+    """Per-latent statistics for the v1 counting rule, on one split's image-level codes.
+
+    Columns: ``fire_<d>`` firing rate; ``dsauc_<d>`` one-vs-rest dataset AUROC, unfolded (direction
+    kept); ``lauc_<d>`` opacity AUROC and ``lp_<d>`` its p-value from the per-group Mann-Whitney test, for
+    every dataset with both opacity classes. ``groups`` gives the cluster key of each image.
+    """
+    from .stats import grouped_mannwhitney
+
+    names = list(codes)
+    n_lat = next(iter(codes.values())).shape[1]
+    table = pd.DataFrame({"latent": np.arange(n_lat)})
+    for d in names:
+        table[f"fire_{d}"] = (codes[d] > 0).mean(0)
+    pooled = np.concatenate([codes[d] for d in names])
+    owner = np.concatenate([np.full(len(codes[d]), i) for i, d in enumerate(names)])
+    for i, d in enumerate(names):
+        table[f"dsauc_{d}"] = auroc_columns(pooled, owner == i)
+    del pooled
+    for d in names:
+        lab = opacity[d]
+        keep = ~np.isnan(lab)
+        if keep.sum() == 0 or len(np.unique(lab[keep])) < 2:
+            continue
+        p, auc = grouped_mannwhitney(codes[d][keep].astype(np.float32), lab[keep] == 1, groups[d][keep])
+        table[f"lauc_{d}"], table[f"lp_{d}"] = auc, p
+    return table
+
+
+def apply_rule_v1(table: pd.DataFrame, datasets: list[str], label_datasets: list[str], tau: float,
+                  dsauc_band: tuple[float, float], fdr: float) -> pd.DataFrame:
+    """Add the v1 decision columns. All thresholds are passed in (they live in the protocol).
+
+    active_all        firing rate >= tau on every dataset
+    cross_dataset     active_all and every one-vs-rest dataset AUROC inside ``dsauc_band``
+    label_consistent  cross_dataset and, on every label dataset, the opacity test is a discovery under
+                      Benjamini-Hochberg over all (latent, label dataset) tests of this dictionary, with
+                      the same direction everywhere
+    """
+    from .stats import benjamini_hochberg
+
+    t = table.copy()
+    lo, hi = dsauc_band
+    t["active_all"] = np.all([t[f"fire_{d}"] >= tau for d in datasets], axis=0)
+    t["cross_dataset"] = t.active_all & np.all(
+        [(t[f"dsauc_{d}"] >= lo) & (t[f"dsauc_{d}"] <= hi) for d in datasets], axis=0)
+    p = np.stack([t[f"lp_{d}"].to_numpy() for d in label_datasets])          # [n_label_ds, n_latents]
+    _, reject = benjamini_hochberg(p.ravel(), fdr)
+    reject = reject.reshape(p.shape)
+    for i, d in enumerate(label_datasets):
+        t[f"ldisc_{d}"] = reject[i]
+    up = np.stack([t[f"lauc_{d}"] > 0.5 for d in label_datasets])
+    pos = reject.all(0) & up.all(0)
+    neg = reject.all(0) & (~up).all(0)
+    t["label_consistent"] = t.cross_dataset & (pos | neg)
+    t["label_direction"] = np.where(pos, "+", np.where(neg, "-", ""))
+    return t

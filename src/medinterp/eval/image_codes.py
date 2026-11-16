@@ -43,3 +43,24 @@ def image_max_codes(acts: ArchivedActivations, enc: Encoder, images_per_chunk: i
         assert density <= enc.k / enc.d_sae + 1e-9, f"{name}: density {density} exceeds k/d_sae"
         out[name] = result
     return out
+
+
+@torch.no_grad()
+def image_codes(acts: ArchivedActivations, enc: Encoder, pooling: str = "max", images_per_chunk: int = 256
+                ) -> dict[str, np.ndarray]:
+    """Like ``image_max_codes`` with a choice of pooling over an image's tokens ("max" or "mean").
+
+    Raises ValueError for an unknown pooling.
+    """
+    if pooling == "max":
+        return image_max_codes(acts, enc, images_per_chunk)
+    if pooling != "mean":
+        raise ValueError(f"pooling must be 'max' or 'mean', got {pooling!r}")
+    out: dict[str, np.ndarray] = {}
+    for name, block in acts.blocks.items():
+        result = np.zeros((block.n_images, enc.d_sae), dtype=np.float16)
+        for img0, x in acts.iter_token_chunks(name, images_per_chunk):
+            n_img = x.shape[0] // acts.n_patches
+            result[img0:img0 + n_img] = enc.encode(x).view(n_img, acts.n_patches, -1).mean(1).numpy()
+        out[name] = result
+    return out

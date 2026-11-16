@@ -3,6 +3,9 @@
 Every dictionary is scored with the best *linear* decoder fitted on training tokens (ridge regression),
 so dictionaries without a meaningful native decoder (random SAEs, signed basis, PCA) are compared on the
 information content of their k-sparse codes rather than on decoder quality.
+
+``own_decoder_fve`` scores the dictionary's own decoder at its per-token top-k, the protocol's primary
+reconstruction statistic; the ridge refit is reported next to it.
 """
 from __future__ import annotations
 
@@ -66,3 +69,53 @@ def split_images(n_images: int, groups: np.ndarray | None, test_frac: float, see
     uniq = np.unique(groups)
     test_groups = set(uniq[rng.random(uniq.size) < test_frac])
     return np.array([g in test_groups for g in groups])
+
+
+def own_decoder_fve(enc, token_chunks) -> float:
+    """FVE of ``enc.decode(enc.encode(x))`` over the given token chunks: the dictionary's own decoder at
+    its per-token top-k. ``enc`` needs ``encode`` and ``decode``. Complexity: one encode-decode pass.
+    Raises ValueError if no tokens are given.
+    """
+    acc = None
+    for x in token_chunks:
+        acc = acc or FVEAccumulator(x.shape[1])
+        acc.add(x, enc.decode(enc.encode(x)))
+    if acc is None:
+        raise ValueError("no tokens given")
+    return acc.fve()
+
+
+class PerImageRecon:
+    """Per-image squared error and token moments, so FVE can be recomputed on any resample of images.
+
+    ``add(x, x_hat, n_patches)`` takes image-aligned token chunks. ``fve(idx)`` returns the FVE over the
+    images ``idx`` (repeats allowed), with SST around the mean of exactly those tokens, which equals
+    ``FVEAccumulator`` on the same tokens. Memory: O(n_images * d_model) for the per-image token sums.
+    """
+
+    def __init__(self) -> None:
+        self._sse: list[np.ndarray] = []
+        self._sumsq: list[np.ndarray] = []
+        self._sums: list[np.ndarray] = []
+        self.n_patches = 0
+
+    def add(self, x: torch.Tensor, x_hat: torch.Tensor, n_patches: int) -> None:
+        self.n_patches = n_patches
+        n_img = x.shape[0] // n_patches
+        xd = x.double().view(n_img, n_patches, -1)
+        err = (x - x_hat).double().view(n_img, n_patches, -1)
+        self._sse.append(err.pow(2).sum((1, 2)).numpy())
+        self._sumsq.append(xd.pow(2).sum((1, 2)).numpy())
+        self._sums.append(xd.sum(1).numpy())
+
+    def arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return np.concatenate(self._sse), np.concatenate(self._sumsq), np.concatenate(self._sums)
+
+    def fve(self, idx: np.ndarray | None = None) -> float:
+        sse, sumsq, sums = self.arrays()
+        if idx is None:
+            idx = np.arange(len(sse))
+        n_tokens = len(idx) * self.n_patches
+        total = sums[idx].sum(0)
+        sst = sumsq[idx].sum() - float(total @ total) / n_tokens
+        return 1.0 - sse[idx].sum() / sst

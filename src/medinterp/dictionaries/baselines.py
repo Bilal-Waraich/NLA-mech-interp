@@ -11,6 +11,9 @@ non-negative entries per row (per-token top-k), so density is matched by constru
   signed_basis      the 1024 coordinate axes of the stage output, +/-: a crude "neuron" proxy. Note this
                     hook is a residual-stream stage output, not a privileged basis; true neurons (MLP
                     hidden units) need a separate harvest.
+  frozen_decoder_sae  random decoder that is never trained, encoder trained on the data (Korznikov et al.);
+                    decoder either isotropic or drawn from the activation covariance
+  covariance_directions  random unit directions drawn from N(0, cov), the data-aware matching null
 """
 from __future__ import annotations
 
@@ -38,6 +41,11 @@ class LinearTopK:
         pre = torch.relu(x @ self.W)
         top = torch.topk(pre, self.k, dim=-1)
         return torch.zeros_like(pre).scatter_(-1, top.indices, top.values)
+
+    @torch.no_grad()
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Own decoder: the latents' directions are the columns of ``W`` (unit for PCA and basis)."""
+        return z @ self.W.T
 
 
 def random_sae(d_model: int, d_sae: int, k: int, seed: int) -> TopKSAE:
@@ -68,3 +76,50 @@ def signed_basis(d_model: int, k: int) -> LinearTopK:
     """Coordinate axes +/-e_i as 2*d_model latents."""
     eye = torch.eye(d_model)
     return LinearTopK(torch.cat([eye, -eye]).T.contiguous(), k, "signed_basis")
+
+
+def isotropic_directions(n_latents: int, d_model: int, seed: int) -> torch.Tensor:
+    """``[n_latents, d_model]`` unit rows drawn uniformly on the sphere."""
+    gen = torch.Generator().manual_seed(seed)
+    D = torch.randn(n_latents, d_model, generator=gen)
+    return D / D.norm(dim=-1, keepdim=True)
+
+
+def covariance_directions(cov: torch.Tensor, n_latents: int, seed: int) -> torch.Tensor:
+    """``[n_latents, d_model]`` unit rows drawn from N(0, cov): random directions shaped like the data.
+
+    This is the data-aware null of the protocol: such directions concentrate in the high-variance
+    subspace, as trained decoder rows could if they merely followed variance.
+    Complexity: O(d_model^3) for the eigendecomposition plus O(n_latents * d_model^2).
+    Raises ValueError if ``cov`` is not square.
+    """
+    if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+        raise ValueError(f"cov must be square, got {tuple(cov.shape)}")
+    evals, evecs = torch.linalg.eigh(cov.double())
+    root = evecs * evals.clamp(min=0).sqrt()             # cov = root @ root.T
+    gen = torch.Generator().manual_seed(seed)
+    g = torch.randn(n_latents, cov.shape[0], generator=gen, dtype=torch.float64)
+    D = (g @ root.T).float()
+    return D / D.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+
+
+def frozen_decoder_sae(data, cfg, decoder: str = "isotropic", cov: torch.Tensor | None = None,
+                       decoder_seed: int = 0, **train_kwargs) -> TopKSAE:
+    """Frozen random decoder with a trained encoder (after Korznikov et al.).
+
+    ``decoder`` is "isotropic" (uniform on the sphere) or "covariance" (drawn from ``cov``). The decoder
+    seed is separate from the training seeds in ``cfg`` so the same decoder can be paired with several
+    encoder runs. Other keyword arguments go to ``train_batchtopk`` (device, log, train_rows, ...).
+    Raises ValueError for an unknown ``decoder`` or a covariance decoder without ``cov``.
+    """
+    from .train import train_batchtopk
+
+    if decoder == "isotropic":
+        W = isotropic_directions(cfg.d_sae, cfg.d_model, decoder_seed)
+    elif decoder == "covariance":
+        if cov is None:
+            raise ValueError("decoder='covariance' needs cov")
+        W = covariance_directions(cov, cfg.d_sae, decoder_seed)
+    else:
+        raise ValueError(f"unknown decoder {decoder!r}")
+    return train_batchtopk(data, cfg, fixed_decoder=W, **train_kwargs)
