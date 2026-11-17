@@ -1,6 +1,6 @@
 """Read-only access to the archived UMedPT Stage-4 activation harvest (thesis run ``xray_v2``).
 
-Layout of ``activations.safetensors`` (verified, see docs/thesis-archive-audit.md §1):
+Layout of ``activations.safetensors`` (verified, see docs/thesis-audit/thesis-archive-audit.md §1):
   activations  [N_tokens, 1024] float32  RMS-normalised to token norm 1024, then per-dataset centred
   dataset_ids  [N_tokens] int32          contiguous blocks: chexpert, rsna, siim_covid, tb
   labels       [N_tokens] int32          image-level canonical group repeated over the image's tokens

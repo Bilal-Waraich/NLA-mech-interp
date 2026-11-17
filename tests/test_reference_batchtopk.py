@@ -13,7 +13,7 @@ What must agree exactly, because our recipe claims to do the same thing:
   - the projection that removes each decoder row's gradient component along the row.
 
 Deliberate differences from the reference that this test does NOT check. They are recorded in
-docs/framing.md section 10 and docs/thesis-archive-audit.md; all of them come from the thesis recipe:
+docs/framing.md section 10 and docs/thesis-audit/thesis-archive-audit.md; all of them come from the thesis recipe:
   - reconstruction loss averaged over dimensions (reference: summed over dimensions);
   - an L1 term on the codes (reference: none);
   - auxiliary loss scaled by min(n_dead / k_aux, 1) and not normalised by the residual variance;

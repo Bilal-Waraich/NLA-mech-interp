@@ -133,7 +133,7 @@ def main_thesis(OUT: Path) -> None:
 
 # ---------------------------------------------------------------- protocol v1
 
-# Values fixed by docs/eval-protocol.md section 3 (dataset band, FDR); tau and the null set as in run 1.
+# Values fixed by docs/specs/eval-protocol.md section 3 (dataset band, FDR); tau and the null set as in run 1.
 V1_DSAUC_BAND = (0.35, 0.65)
 V1_FDR = 0.05
 V1_LABEL_DATASETS = ["chexpert", "rsna", "siim_covid"]

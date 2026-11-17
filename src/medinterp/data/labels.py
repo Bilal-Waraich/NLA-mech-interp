@@ -17,7 +17,7 @@ import pandas as pd
 CHEXPERT_OPACITY_LABELS = ("Lung Opacity", "Consolidation", "Pneumonia")
 UNCERTAIN_POLICIES = ("exclude", "positive_wins")
 
-# Thesis-harvest counts recorded in docs/build-spec.md section 4 (checked 2026-11-16).
+# Thesis-harvest counts recorded in docs/specs/build-spec.md section 4 (checked 2026-11-16).
 EXPECTED_COUNTS = {
     "chexpert_thesis_group": {0: 4116, 5: 2839, 2: 859, 6: 794, 1: 750, 3: 457, 4: 185},
     "rsna_detailed_class": {"Lung Opacity": 2260, "No Lung Opacity / Not Normal": 4435, "Normal": 3305},
