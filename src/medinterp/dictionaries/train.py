@@ -112,6 +112,153 @@ def _snapshot(params: dict[str, torch.Tensor], k: int) -> TopKSAE:
                    Wd.detach().cpu().clone(), params["b_dec"].detach().cpu().clone(), k)
 
 
+class BatchTopKTrainer:
+    """The training loop of ``train_batchtopk`` as an object that can stop and resume.
+
+    ``run(until_step, should_stop)`` advances the loop; ``state_dict()`` / ``load_state_dict()`` hold
+    everything the next step depends on (parameters, Adam moments, dead-latent counters, the batch RNG),
+    so a run resumed from a saved state on the same device produces the same weights as an
+    uninterrupted run. The model's own random number use ends with the initialisation; nothing later
+    draws from torch's generator.
+
+    Parameters are those of ``train_batchtopk``. Raises ValueError like it does.
+    """
+
+    def __init__(self, data: dict[str, np.ndarray], cfg: TrainConfig, device: str = "cpu", log=print,
+                 train_rows: dict[str, np.ndarray] | None = None,
+                 on_checkpoint: Callable[[int, TopKSAE], None] | None = None,
+                 fixed_decoder: torch.Tensor | None = None) -> None:
+        self.cfg, self.log, self.on_checkpoint = cfg, log, on_checkpoint
+        self.frozen_decoder = fixed_decoder is not None
+        torch.manual_seed(cfg.resolved_init_seed)
+        self.sampler = _BatchSampler(data, cfg, train_rows)
+        dev = torch.device(device)
+        self.device = dev
+
+        if fixed_decoder is None:
+            # Thesis initialisation: kaiming-uniform W_enc, W_dec = row-normalised W_enc^T * 0.1, W_enc = W_dec^T.
+            W_enc = torch.empty(cfg.d_model, cfg.d_sae)
+            torch.nn.init.kaiming_uniform_(W_enc)
+            W_dec = W_enc.T.clone()
+            W_dec = W_dec / W_dec.norm(dim=-1, keepdim=True) * 0.1
+        else:
+            if tuple(fixed_decoder.shape) != (cfg.d_sae, cfg.d_model):
+                raise ValueError(f"fixed_decoder has shape {tuple(fixed_decoder.shape)}, "
+                                 f"expected {(cfg.d_sae, cfg.d_model)}")
+            W_dec = fixed_decoder.float() / fixed_decoder.float().norm(dim=-1, keepdim=True)
+        self.params = {
+            "W_enc": torch.nn.Parameter(W_dec.T.clone().contiguous().to(dev)),
+            "W_dec": torch.nn.Parameter(W_dec.clone().to(dev), requires_grad=fixed_decoder is None),
+            "b_enc": torch.nn.Parameter(torch.zeros(cfg.d_sae, device=dev)),
+            "b_dec": torch.nn.Parameter(torch.zeros(cfg.d_model, device=dev)),
+        }
+        self.trainable = [p for p in self.params.values() if p.requires_grad]
+        self.opt = torch.optim.Adam(self.trainable, lr=cfg.lr, betas=(0.9, 0.999))
+        self.inactive = torch.zeros(cfg.d_sae, device=dev)
+        self.step = 0
+
+    @property
+    def finished(self) -> bool:
+        return self.step >= self.cfg.steps
+
+    def run(self, until_step: int | None = None, should_stop: Callable[[], bool] | None = None) -> None:
+        """Train up to ``until_step`` (default: ``cfg.steps``), or until ``should_stop()`` is true.
+
+        ``should_stop`` is checked after every completed step, so stopping never splits a step.
+        """
+        cfg, params, dev = self.cfg, self.params, self.device
+        checkpoints = set(cfg.checkpoint_steps)
+        last = cfg.steps if until_step is None else min(until_step, cfg.steps)
+        while self.step < last:
+            step = self.step + 1
+            x = torch.from_numpy(self.sampler().astype(np.float32)).to(dev)
+            B = x.shape[0]
+
+            pre = torch.relu((x - params["b_dec"]) @ params["W_enc"] + params["b_enc"])
+            top = torch.topk(pre.flatten(), cfg.k * B)                      # BatchTopK
+            z = torch.zeros_like(pre.flatten()).scatter(-1, top.indices, top.values).view_as(pre)
+            x_hat = z @ params["W_dec"] + params["b_dec"]
+
+            # All tensors below keep fixed shapes. Data-dependent shapes (boolean indexing such as
+            # pre[:, dead]) make the MPS backend compile and cache a new graph for every distinct number
+            # of dead latents, which leaked ~50 MB/min of host memory in the first run.
+            with torch.no_grad():
+                fired = z.sum(0) > 0
+                self.inactive = torch.where(fired, torch.zeros_like(self.inactive), self.inactive + 1)
+            l2 = (x_hat - x).pow(2).mean()
+            l1 = cfg.l1_coeff * z.abs().sum(-1).mean()
+            aux = torch.zeros((), device=dev)
+            dead = self.inactive >= cfg.n_batches_to_dead
+            n_dead = int(dead.sum())
+            if n_dead > 0:
+                k_aux = cfg.d_model // 2
+                scale = min(n_dead / k_aux, 1.0)
+                # Mask instead of slice: non-dead latents become 0, so when fewer than k_aux latents are
+                # dead the extra selected entries are zeros and contribute nothing (same result as slicing).
+                pre_dead = pre * dead.to(pre.dtype)
+                t = torch.topk(pre_dead, k_aux, dim=-1)
+                z_aux = torch.zeros_like(pre_dead).scatter(-1, t.indices, t.values)
+                aux = cfg.aux_penalty * scale * (z_aux @ params["W_dec"] - (x - x_hat).detach()).pow(2).mean()
+            loss = l2 + l1 + aux
+
+            self.opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.trainable, cfg.max_grad_norm)
+            if not self.frozen_decoder:
+                with torch.no_grad():  # keep decoder rows on the unit sphere
+                    Wd = params["W_dec"]
+                    Wn = Wd / Wd.norm(dim=-1, keepdim=True)
+                    Wd.grad -= (Wd.grad * Wn).sum(-1, keepdim=True) * Wn
+                    Wd.copy_(Wn)
+            for g in self.opt.param_groups:
+                g["lr"] = cfg.lr * _lr_factor(step, cfg)
+            self.opt.step()
+            self.step = step
+
+            if step % cfg.log_every == 0 or step == 1:
+                ev = 1 - (x - x_hat).var().item() / x.var().item()
+                self.log(f"step {step:>6}  loss {loss.item():.3f}  l2 {l2.item():.3f}  aux {aux.item():.4f}  "
+                         f"EV {ev:.4f}  dead {int(dead.sum())}")
+            if self.on_checkpoint is not None and step in checkpoints:
+                self.on_checkpoint(step, self.snapshot())
+            if should_stop is not None and should_stop():
+                return
+
+    def snapshot(self) -> TopKSAE:
+        return _snapshot(self.params, self.cfg.k)
+
+    def state_dict(self) -> dict:
+        """CPU copy of everything needed to continue; the batch RNG state is a plain dict."""
+        return {"step": self.step,
+                "params": {n: p.detach().cpu().clone() for n, p in self.params.items()},
+                "opt": _to_cpu(self.opt.state_dict()),
+                "inactive": self.inactive.detach().cpu().clone(),
+                "rng": self.sampler.rng.bit_generator.state}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore a state from ``state_dict``. Raises ValueError if the shapes do not match the config."""
+        for n, p in self.params.items():
+            if tuple(state["params"][n].shape) != tuple(p.shape):
+                raise ValueError(f"state parameter {n} has shape {tuple(state['params'][n].shape)}, "
+                                 f"expected {tuple(p.shape)}")
+            with torch.no_grad():
+                p.copy_(state["params"][n].to(self.device))
+        self.opt.load_state_dict(state["opt"])
+        self.inactive = state["inactive"].to(self.device)
+        self.sampler.rng.bit_generator.state = state["rng"]
+        self.step = int(state["step"])
+
+
+def _to_cpu(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu().clone()
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu(v) for v in obj]
+    return obj
+
+
 def train_batchtopk(data: dict[str, np.ndarray], cfg: TrainConfig, device: str = "cpu",
                     log=print, train_rows: dict[str, np.ndarray] | None = None,
                     on_checkpoint: Callable[[int, TopKSAE], None] | None = None,
@@ -124,83 +271,8 @@ def train_batchtopk(data: dict[str, np.ndarray], cfg: TrainConfig, device: str =
       fixed_decoder    optional ``[d_sae, d_model]`` decoder that stays frozen (rows are unit-normalised
                        once); the encoder is initialised as its transpose, as in the thesis recipe
     Raises ValueError for an unknown sampling mode, an empty ``train_rows`` entry or a decoder of the
-    wrong shape.
+    wrong shape. Use ``BatchTopKTrainer`` directly to stop and resume a run.
     """
-    torch.manual_seed(cfg.resolved_init_seed)
-    sampler = _BatchSampler(data, cfg, train_rows)
-    dev = torch.device(device)
-
-    if fixed_decoder is None:
-        # Thesis initialisation: kaiming-uniform W_enc, W_dec = row-normalised W_enc^T * 0.1, W_enc = W_dec^T.
-        W_enc = torch.empty(cfg.d_model, cfg.d_sae)
-        torch.nn.init.kaiming_uniform_(W_enc)
-        W_dec = W_enc.T.clone()
-        W_dec = W_dec / W_dec.norm(dim=-1, keepdim=True) * 0.1
-    else:
-        if tuple(fixed_decoder.shape) != (cfg.d_sae, cfg.d_model):
-            raise ValueError(f"fixed_decoder has shape {tuple(fixed_decoder.shape)}, "
-                             f"expected {(cfg.d_sae, cfg.d_model)}")
-        W_dec = fixed_decoder.float() / fixed_decoder.float().norm(dim=-1, keepdim=True)
-    params = {
-        "W_enc": torch.nn.Parameter(W_dec.T.clone().contiguous().to(dev)),
-        "W_dec": torch.nn.Parameter(W_dec.clone().to(dev), requires_grad=fixed_decoder is None),
-        "b_enc": torch.nn.Parameter(torch.zeros(cfg.d_sae, device=dev)),
-        "b_dec": torch.nn.Parameter(torch.zeros(cfg.d_model, device=dev)),
-    }
-    trainable = [p for p in params.values() if p.requires_grad]
-    opt = torch.optim.Adam(trainable, lr=cfg.lr, betas=(0.9, 0.999))
-    inactive = torch.zeros(cfg.d_sae, device=dev)
-    checkpoints = set(cfg.checkpoint_steps)
-
-    for step in range(1, cfg.steps + 1):
-        x = torch.from_numpy(sampler().astype(np.float32)).to(dev)
-        B = x.shape[0]
-
-        pre = torch.relu((x - params["b_dec"]) @ params["W_enc"] + params["b_enc"])
-        top = torch.topk(pre.flatten(), cfg.k * B)                      # BatchTopK
-        z = torch.zeros_like(pre.flatten()).scatter(-1, top.indices, top.values).view_as(pre)
-        x_hat = z @ params["W_dec"] + params["b_dec"]
-
-        # All tensors below keep fixed shapes. Data-dependent shapes (boolean indexing such as
-        # pre[:, dead]) make the MPS backend compile and cache a new graph for every distinct number
-        # of dead latents, which leaked ~50 MB/min of host memory in the first run.
-        with torch.no_grad():
-            fired = z.sum(0) > 0
-            inactive = torch.where(fired, torch.zeros_like(inactive), inactive + 1)
-        l2 = (x_hat - x).pow(2).mean()
-        l1 = cfg.l1_coeff * z.abs().sum(-1).mean()
-        aux = torch.zeros((), device=dev)
-        dead = inactive >= cfg.n_batches_to_dead
-        n_dead = int(dead.sum())
-        if n_dead > 0:
-            k_aux = cfg.d_model // 2
-            scale = min(n_dead / k_aux, 1.0)
-            # Mask instead of slice: non-dead latents become 0, so when fewer than k_aux latents are
-            # dead the extra selected entries are zeros and contribute nothing (same result as slicing).
-            pre_dead = pre * dead.to(pre.dtype)
-            t = torch.topk(pre_dead, k_aux, dim=-1)
-            z_aux = torch.zeros_like(pre_dead).scatter(-1, t.indices, t.values)
-            aux = cfg.aux_penalty * scale * (z_aux @ params["W_dec"] - (x - x_hat).detach()).pow(2).mean()
-        loss = l2 + l1 + aux
-
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable, cfg.max_grad_norm)
-        if fixed_decoder is None:
-            with torch.no_grad():  # keep decoder rows on the unit sphere
-                Wd = params["W_dec"]
-                Wn = Wd / Wd.norm(dim=-1, keepdim=True)
-                Wd.grad -= (Wd.grad * Wn).sum(-1, keepdim=True) * Wn
-                Wd.copy_(Wn)
-        for g in opt.param_groups:
-            g["lr"] = cfg.lr * _lr_factor(step, cfg)
-        opt.step()
-
-        if step % cfg.log_every == 0 or step == 1:
-            ev = 1 - (x - x_hat).var().item() / x.var().item()
-            log(f"step {step:>6}  loss {loss.item():.3f}  l2 {l2.item():.3f}  aux {aux.item():.4f}  "
-                f"EV {ev:.4f}  dead {int(dead.sum())}")
-        if on_checkpoint is not None and step in checkpoints:
-            on_checkpoint(step, _snapshot(params, cfg.k))
-
-    return _snapshot(params, cfg.k)
+    trainer = BatchTopKTrainer(data, cfg, device, log, train_rows, on_checkpoint, fixed_decoder)
+    trainer.run()
+    return trainer.snapshot()

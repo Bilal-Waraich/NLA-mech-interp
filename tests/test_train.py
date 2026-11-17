@@ -105,3 +105,34 @@ def test_checkpoints_are_taken_at_the_given_steps() -> None:
 def test_unknown_sampling_is_rejected() -> None:
     with pytest.raises(ValueError):
         train_batchtopk(_data(), TrainConfig(**SMALL, sampling="stratified"), **quiet)
+
+
+def test_resume_from_state_is_identical():
+    """Stopping, saving the state through torch.save and resuming gives the uninterrupted weights."""
+    import io
+    from medinterp.dictionaries.train import BatchTopKTrainer
+
+    cfg = TrainConfig(**SMALL, checkpoint_steps=(30,))
+    full = train_batchtopk(_data(), cfg, **quiet)
+    first = BatchTopKTrainer(_data(), cfg, **quiet)
+    first.run(until_step=23)
+    buf = io.BytesIO()
+    torch.save(first.state_dict(), buf)
+    buf.seek(0)
+    seen = []
+    second = BatchTopKTrainer(_data(), cfg, on_checkpoint=lambda s, _: seen.append(s), **quiet)
+    second.load_state_dict(torch.load(buf, weights_only=False))
+    second.run()
+    resumed = second.snapshot()
+    assert second.finished and seen == [30]
+    for name in ("W_enc", "b_enc", "W_dec", "b_dec"):
+        assert torch.equal(getattr(full, name), getattr(resumed, name)), name
+
+
+def test_should_stop_ends_after_a_whole_step():
+    from medinterp.dictionaries.train import BatchTopKTrainer
+
+    trainer = BatchTopKTrainer(_data(), TrainConfig(**SMALL), **quiet)
+    calls = []
+    trainer.run(should_stop=lambda: calls.append(1) or len(calls) >= 7)
+    assert trainer.step == 7 and not trainer.finished
