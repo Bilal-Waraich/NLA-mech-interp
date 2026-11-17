@@ -148,3 +148,21 @@ def test_covariance_null_reproduces_known_quantile() -> None:
     q = float(np.quantile(cos, 0.999))
     print(f"covariance null: q99.9 = {q:.4f}, share >= 0.7 = {(cos >= 0.7).mean():.4f}")
     assert abs(q - 0.77) <= 0.02
+
+
+def test_sweep_metrics_on_toy_tokens():
+    """FVE of an exact dictionary is 1; a dictionary matches itself functionally and by decoder."""
+    from medinterp.eval.sweep_metrics import EvalTokens, decoder_overlap, functional_overlap, score_dictionary
+    from medinterp.dictionaries.baselines import LinearTopK
+
+    gen = torch.Generator().manual_seed(0)
+    basis = torch.linalg.qr(torch.randn(16, 16, generator=gen))[0]
+    enc = LinearTopK(torch.cat([basis, -basis], 1), 16, "full")        # all 16 signed axes: exact
+    x = torch.randn(40 * 4, 16, generator=gen)
+    tokens = EvalTokens(x, np.repeat(np.arange(20), 2), 4)
+    sc = score_dictionary(enc, tokens, n_resamples=50, confidence=0.95, seed=0)
+    assert sc.fve == pytest.approx(1.0, abs=1e-5)
+    assert sc.fve_ci[0] == pytest.approx(1.0, abs=1e-5)
+    assert decoder_overlap(enc.W.T, enc.W.T) == pytest.approx(np.ones(32), abs=1e-5)
+    scores, dead_a, dead_b = functional_overlap(enc, enc, tokens)
+    assert dead_a == dead_b == 0 and np.allclose(scores, 1.0, atol=1e-5)
