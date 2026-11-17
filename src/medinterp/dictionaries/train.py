@@ -7,6 +7,10 @@ betas (0.9, 0.999), grad clip 1.0, linear warmup 1000 steps then cosine decay to
 to an equal number of tokens per dataset. Differences from the thesis run: fp32 instead of AMP fp16,
 explicit seeds, and b_dec initialised to zero (the data are per-dataset centred).
 
+The L1 term is not part of standard TopK / BatchTopK training (Gao et al. 2024, Bussmann et al. 2024);
+it is kept to stay on the thesis recipe. This and the other differences from the reference
+implementation are listed in docs/framing.md section 10 and checked in tests/test_reference_batchtopk.py.
+
 Options added for the protocol (all default to the behaviour above, which tests/_legacy_train.py freezes):
   init_seed / data_seed   separate seeds for the initial weights and for the batch order
   sampling                "equal" (same tokens per dataset per batch) or "proportional" (uniform over all
