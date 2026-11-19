@@ -2,7 +2,8 @@
 
 Run table (``configs/sweep_v1.csv``): one row per training run, generated from the protocol's phase table
 by ``sweep_table``. A *setting* is a group of runs that differ only in their seeds; stability is measured
-between the runs of one setting. Phase 2 rows are appended for the settings the protocol carries forward.
+between the runs of one setting. Phase 2 rows (for the settings the protocol carries forward) and then the
+phase 1c rows (the k extension) are appended after phase 1.
 
 Two deliberate readings of the phase table (also in the WP1 notes):
   2b   the 2 x 2 design of initialisation seed x batch-order seed reuses the phase 1 runs (0, 0) and
@@ -35,6 +36,9 @@ from .dictionaries.train import BatchTopKTrainer, TrainConfig
 SWEEP_COLUMNS = ["row", "phase", "setting", "run_id", "decoder", "d_sae", "k", "steps", "init_seed",
                  "data_seed", "sampling", "l1_coeff", "data_fraction", "checkpoints", "run_units"]
 PHASE1_KS = (4, 8, 16, 32, 48)
+# Phase 1c: larger k at 1,024 latents, added after the decoder diagnostic had no minimum up to k = 48.
+EXTENSION_D_SAE = 1024
+EXTENSION_KS = (64, 96)
 BASE_D_SAE = 4096
 BASE_STEPS = 20_000
 BASE_L1 = TrainConfig().l1_coeff
@@ -44,8 +48,11 @@ LONG_CHECKPOINTS = (20_000, 40_000, 80_000)
 
 # Settings carried forward, as (d_sae, k); roles and rules are in protocol section 5.
 CORE_SETTINGS = ((1024, 8), (1024, 16), (1024, 32), (4096, 32))
-DENSE_REFERENCE = (4096, 48)
-APPENDIX_SETTINGS = ((1024, 48), (4096, 4), (4096, 8), (4096, 16))
+# The setting of the thesis SAE, which the protocol's outcome table names.
+THESIS_SETTING = (4096, 48)
+# (1024, 64) becomes a core setting instead if the label-transfer rule of protocol section 5 says so.
+DENSE_REFERENCES = ((4096, 48), (1024, 64))
+APPENDIX_SETTINGS = ((1024, 48), (1024, 96), (4096, 4), (4096, 8), (4096, 16))
 PHASE2_ALL_TESTS = ((1024, 8), (1024, 16), (1024, 32))
 PHASE2_TRAINING_LENGTH_ONLY = ((4096, 32), (4096, 48))
 
@@ -54,9 +61,11 @@ def setting_role(d_sae: int, k: int) -> str:
     """Role of a (d_sae, k) pair: "core", "dense reference", "appendix" or "not carried forward"."""
     if (d_sae, k) in CORE_SETTINGS:
         return "core"
-    if (d_sae, k) == DENSE_REFERENCE:
+    if (d_sae, k) in DENSE_REFERENCES:
         return "dense reference"
-    return "appendix" if (d_sae, k) in APPENDIX_SETTINGS else "not carried forward"
+    if (d_sae, k) in APPENDIX_SETTINGS:
+        return "appendix"
+    return "not carried forward"
 
 
 def run_units(d_sae: int, steps: int) -> float:
@@ -97,10 +106,11 @@ def _other_phase2_rows(d_sae: int, k: int) -> list[dict]:
     return rows
 
 
-def sweep_table(phase2: bool = False) -> pd.DataFrame:
-    """The run table: phases 1a, 1b and 1n, followed by phase 2 if ``phase2`` is true.
+def sweep_table(full: bool = False) -> pd.DataFrame:
+    """The run table: phases 1a, 1b and 1n, followed, if ``full`` is true, by phase 2 and then phase 1c.
 
-    Phase 2 rows only follow the phase 1 rows, so row numbers of finished runs never change.
+    Rows are only ever appended in the order they were decided, so row numbers of finished runs never
+    change; that is why phase 1c comes after phase 2.
     Seeds: a phase-1 seed s sets both the initialisation and the batch order (as the Stage 0.6 seeds did).
     """
     rows = []
@@ -111,11 +121,13 @@ def sweep_table(phase2: bool = False) -> pd.DataFrame:
     rows += [_row("1b", 16_384, 16, s, s) for s in range(3)]
     for k in PHASE1_KS:
         rows.append(_row("1n", BASE_D_SAE, k, 0, 0, decoder="frozen_isotropic", variant="frozeniso"))
-    if phase2:
+    if full:
         for d_sae, k in PHASE2_ALL_TESTS:
             rows += _training_length_rows(d_sae, k) + _other_phase2_rows(d_sae, k)
         for d_sae, k in PHASE2_TRAINING_LENGTH_ONLY:
             rows += _training_length_rows(d_sae, k)
+        for k in EXTENSION_KS:
+            rows += [_row("1c", EXTENSION_D_SAE, k, s, s) for s in range(5)]
     table = pd.DataFrame(rows)
     table.insert(0, "row", np.arange(len(table)))
     if not table.run_id.is_unique:
@@ -143,7 +155,7 @@ def checkpoint_steps(row) -> tuple[int, ...]:
 
 def seedsplit_base_rows(table: pd.DataFrame, d_sae: int, k: int) -> pd.DataFrame:
     """The phase 1 runs (0, 0) and (1, 1) that complete the 2 x 2 design of phase 2b at one setting."""
-    base = table[table.phase.isin(("1a", "1b")) & (table.d_sae == d_sae) & (table.k == k)]
+    base = table[table.phase.isin(("1a", "1b", "1c")) & (table.d_sae == d_sae) & (table.k == k)]
     return base[[(i, b) in ((0, 0), (1, 1)) for i, b in zip(base.init_seed, base.data_seed)]]
 
 
@@ -342,6 +354,96 @@ def summarise_decoder_diagnostic(runs: pd.DataFrame, fve: pd.DataFrame | None = 
             row["mean_dead_on_val"] = float(trained.n_dead.mean()) if len(trained) else math.nan
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def per_latent_pair_table(cosine: np.ndarray, partner: np.ndarray, image_rate_a: np.ndarray,
+                          image_rate_b: np.ndarray) -> pd.DataFrame:
+    """One row per latent of run A: its one-to-one partner in run B, their decoder cosine and firing rates.
+
+    ``cosine`` and ``partner`` come from ``one_to_one`` (NaN and -1 where a latent has no partner); the rates
+    are image shares from ``firing_rates``. Raises ValueError if the lengths of A's arrays differ.
+    """
+    n = len(cosine)
+    if not len(partner) == len(image_rate_a) == n:
+        raise ValueError("cosine, partner and image_rate_a must have one entry per latent of run A")
+    has_partner = partner >= 0
+    rate_b = np.full(n, np.nan)
+    rate_b[has_partner] = image_rate_b[partner[has_partner]]
+    return pd.DataFrame({"latent": np.arange(n), "partner": partner, "cosine": cosine,
+                         "image_rate_a": image_rate_a, "image_rate_partner": rate_b})
+
+
+def summarise_per_latent(pairs: list[pd.DataFrame], threshold: float) -> dict:
+    """Per-latent summary of one setting over its seed pairs (protocol section 5, per-latent check).
+
+    For each pair: S over all latents (as P1.3), S over the latents of run A that fire on at least one image,
+    the share of recurring latents that fire in both runs, and the Spearman correlation between a live
+    latent's image firing rate and its partner cosine. Returns the mean and min-max over pairs of each, and
+    the median firing rate of recurring and of non-recurring live latents, pooled over pairs.
+    Raises ValueError for an empty list.
+    """
+    from scipy.stats import spearmanr
+
+    if not pairs:
+        raise ValueError("need at least one seed pair")
+    per_pair, recurring_rates, other_rates = [], [], []
+    for t in pairs:
+        cos = np.nan_to_num(t.cosine.to_numpy(), nan=-np.inf)
+        recurring = cos >= threshold
+        live = t.image_rate_a.to_numpy() > 0
+        live_both = live & (np.nan_to_num(t.image_rate_partner.to_numpy(), nan=0.0) > 0)
+        rho = spearmanr(t.image_rate_a[live], t.cosine[live], nan_policy="omit").statistic if live.sum() > 2 else np.nan
+        per_pair.append({"S_all": recurring.mean(), "S_live": recurring[live].mean() if live.any() else np.nan,
+                         "recurring_live_in_both": live_both[recurring].mean() if recurring.any() else np.nan,
+                         "spearman_rate_cosine": float(rho), "n_live_a": int(live.sum())})
+        recurring_rates.append(t.image_rate_a[recurring & live])
+        other_rates.append(t.image_rate_a[~recurring & live])
+    table = pd.DataFrame(per_pair)
+    out = {"n_pairs": len(pairs)}
+    for col in table.columns:
+        out[col] = {"mean": float(table[col].mean()), "min": float(table[col].min()), "max": float(table[col].max())}
+    out["median_image_rate_recurring"] = float(pd.concat(recurring_rates).median()) if len(pd.concat(recurring_rates)) else math.nan
+    out["median_image_rate_not_recurring"] = float(pd.concat(other_rates).median()) if len(pd.concat(other_rates)) else math.nan
+    return out
+
+
+def label_transfer_table(summaries: Mapping[str, dict], ms: tuple[int, ...] = (1, 5)) -> pd.DataFrame:
+    """P1.2's statistic per setting from the probe outputs: mean over trained seeds, and trained vs nulls.
+
+    ``summaries`` maps a setting name (``d<d_sae>_k<k>_s<steps>``) to the ``summary.json`` content of
+    ``stage0_metrics.py --protocol v1`` run on that setting's seeds. Trained seeds are the dictionaries
+    without a null name. Raises KeyError if a summary lacks a probe value for one of ``ms``.
+    """
+    null_names = ("random_seed", "signed_pca", "signed_basis")
+    rows = []
+    for setting, summary in summaries.items():
+        d_sae, k = int(setting.split("_")[0][1:]), int(setting.split("_k")[1].split("_")[0])
+        trained = {n: v for n, v in summary["dictionaries"].items() if not n.startswith(null_names)}
+        row = {"setting": setting, "d_sae": d_sae, "k": k, "role": setting_role(d_sae, k), "n_seeds": len(trained)}
+        for m in ms:
+            values = [v[f"probe_mean_cross_auroc_m{m}"][0] for v in trained.values()]
+            comparison = summary.get("trained_vs_null", {}).get(f"probe_m{m}", {})
+            row.update({f"m{m}_mean": float(np.mean(values)), f"m{m}_min": float(np.min(values)),
+                        f"m{m}_max": float(np.max(values)), f"m{m}_best_null": comparison.get("best_null"),
+                        f"m{m}_separated": comparison.get("separated"), f"m{m}_gap": comparison.get("gap")})
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(["d_sae", "k"]).reset_index(drop=True)
+
+
+def extension_k_role(table: pd.DataFrame, candidate: tuple[int, int] = (EXTENSION_D_SAE, EXTENSION_KS[0]),
+                     ms: tuple[int, ...] = (1, 5)) -> str:
+    """The protocol's label-transfer rule for the k extension (section 5): "core" if the candidate's mean
+    statistic is above every core setting's for every m in ``ms``, otherwise "dense reference".
+
+    Raises ValueError if the candidate or a core setting is missing from ``table``.
+    """
+    index = {(int(r.d_sae), int(r.k)): r for r in table.itertuples()}
+    missing = [s for s in (candidate, *CORE_SETTINGS) if s not in index]
+    if missing:
+        raise ValueError(f"label-transfer results missing for {missing}")
+    above = all(getattr(index[candidate], f"m{m}_mean") > getattr(index[s], f"m{m}_mean")
+                for m in ms for s in CORE_SETTINGS)
+    return "core" if above else "dense reference"
 
 
 def classify_outcome(S_by_setting: dict[str, float], thesis_setting: str, small_settings: list[str],

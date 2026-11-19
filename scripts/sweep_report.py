@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from medinterp.sweep import (BASE_STEPS, DENSE_REFERENCE, PHASE2_ALL_TESTS, PHASE2_TRAINING_LENGTH_ONLY,
+from medinterp.sweep import (BASE_STEPS, PHASE2_ALL_TESTS, PHASE2_TRAINING_LENGTH_ONLY, THESIS_SETTING,
                              classify_outcome, p11_supported, setting_name, setting_role,
                              training_length_table)
 
@@ -37,7 +37,8 @@ ROOT = Path(os.environ.get("MEDINTERP_DATA", REPO))
 P11_MARGIN, P11_MAX_K = 0.02, 16
 OUTCOME_THRESHOLDS = {"high": 0.30, "low": 0.15, "under_training": 0.10}
 OUTCOME_SMALL_MAX_K, OUTCOME_SMALL_D_SAE = 16, 1024
-N_PHASE1_SETTINGS = 11
+# Settings at 20k steps that the outcome row reads: 11 of phases 1a and 1b, and 2 of phase 1c.
+N_BASE_SETTINGS = 13
 
 
 def main() -> None:
@@ -73,17 +74,18 @@ def main() -> None:
     report["training_length"] = training.to_dict("records")
     training_complete = len(training) == len(PHASE2_ALL_TESTS + PHASE2_TRAINING_LENGTH_ONLY)
 
-    # 4. Outcome row. Only the 20k settings of phase 1 enter it: the 80k runs also have a 20k checkpoint.
+    # 4. Outcome row. Only the 20k settings of phase 1 (1a, 1b, 1c) enter it: the 80k runs also have a 20k
+    # checkpoint, and the phase 2 variants carry a suffix.
     at_base = curve[(curve.steps == BASE_STEPS) & curve.setting.str.fullmatch(rf"d\d+_k\d+_s{BASE_STEPS}")]
     phase1 = at_base.set_index("setting").S_mean.to_dict()
-    thesis = setting_name(*DENSE_REFERENCE, BASE_STEPS)
+    thesis = setting_name(*THESIS_SETTING, BASE_STEPS)
     small = at_base[(at_base.k <= OUTCOME_SMALL_MAX_K) | (at_base.d_sae == OUTCOME_SMALL_D_SAE)].setting.tolist()
     deltas = training.set_index("setting").delta.to_dict() if training_complete else None
     if thesis in phase1:
         report["outcome"] = {"row": classify_outcome(phase1, thesis, small, deltas, OUTCOME_THRESHOLDS),
                              "S_thesis_setting": phase1[thesis], "small_settings": {s: phase1[s] for s in small},
                              "under_training_deltas": deltas, "thresholds": OUTCOME_THRESHOLDS,
-                             "complete": training_complete and len(phase1) == N_PHASE1_SETTINGS}
+                             "complete": training_complete and len(phase1) == N_BASE_SETTINGS}
     (args.sweep / "report.json").write_text(json.dumps(report, indent=2, default=float))
     print(json.dumps({k: report.get(k) for k in ("outcome", "training_length")}, indent=2, default=float))
     if "p11" in report:

@@ -33,7 +33,7 @@ from medinterp.sweep import BASE_STEPS, run_dir_checkpoint, summarise_decoder_di
 
 REPO = Path(__file__).resolve().parents[1]
 ROOT = Path(os.environ.get("MEDINTERP_DATA", REPO))
-PHASES = ("1a", "1b")
+PHASES = ("1a", "1b", "1c")
 
 
 def main() -> None:

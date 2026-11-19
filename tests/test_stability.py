@@ -190,3 +190,16 @@ def test_sweep_metrics_on_toy_tokens():
     assert decoder_overlap(enc.W.T, enc.W.T) == pytest.approx(np.ones(32), abs=1e-5)
     scores, dead_a, dead_b = functional_overlap(enc, enc, tokens)
     assert dead_a == dead_b == 0 and np.allclose(scores, 1.0, atol=1e-5)
+
+
+def test_firing_rates_count_tokens_and_images():
+    from medinterp.dictionaries.baselines import LinearTopK
+    from medinterp.eval.sweep_metrics import EvalTokens, firing_rates
+
+    # Latent 0 fires on every token, latent 1 only on the first image's tokens, latent 2 never (top-k = 2).
+    W = torch.tensor([[1.0, 0.0, -1.0], [0.0, 1.0, -1.0]])
+    x = torch.tensor([[1.0, 1.0], [1.0, 1.0], [1.0, -1.0], [1.0, -1.0]])   # 2 images x 2 tokens
+    enc = LinearTopK(W, 2, "toy")
+    token_rate, image_rate = firing_rates(enc, EvalTokens(x, np.array([0, 1]), 2))
+    assert token_rate.tolist() == pytest.approx([1.0, 0.5, 0.0])
+    assert image_rate.tolist() == pytest.approx([1.0, 0.5, 0.0])

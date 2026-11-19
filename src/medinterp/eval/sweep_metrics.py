@@ -8,6 +8,7 @@ harvest), so every dictionary of the sweep is scored on exactly the same tokens.
                       every image
   decoder_overlap     one-to-one decoder cosine between two dictionaries
   decoder_pairwise_cosine  mean absolute cosine between the decoder rows of one dictionary
+  firing_rates        per latent, the share of tokens and of images on which it fires
   covariance_null     the data-aware null of decoder matching: an anchor against random directions drawn
                       from the token covariance
   functional_overlap  one-to-one correlation of token-level sparse codes
@@ -95,6 +96,26 @@ def score_dictionary(enc, tokens: EvalTokens, n_resamples: int, confidence: floa
     return DictionaryScore(boot.estimate, (boot.ci_low, boot.ci_high), boot.samples,
                            int((fires == 0).sum()), int((on_image == tokens.n_images).sum()),
                            (fires / tokens.x.shape[0]).numpy())
+
+
+@torch.no_grad()
+def firing_rates(enc, tokens: EvalTokens, device: str = "cpu", images_per_chunk: int = 256
+                 ) -> tuple[np.ndarray, np.ndarray]:
+    """Per latent: the share of tokens and the share of images on which it is non-zero (per-token top-k).
+
+    A latent with an image share of 0 never fires on these tokens (dead here). Cheaper than
+    ``score_dictionary`` because it skips the decode and the bootstrap.
+    Complexity: O(N_tokens * d_model * d_sae).
+    """
+    fires = torch.zeros(enc.d_sae, dtype=torch.float64)
+    on_image = torch.zeros(enc.d_sae, dtype=torch.float64)
+    P = tokens.n_patches
+    moved = _to_device(enc, device)
+    for x in tokens.chunks(images_per_chunk):
+        nz = (moved.encode(x.to(device)) != 0).cpu()
+        fires += nz.sum(0).double()
+        on_image += nz.view(-1, P, nz.shape[1]).any(1).sum(0).double()
+    return (fires / tokens.x.shape[0]).numpy(), (on_image / tokens.n_images).numpy()
 
 
 def _to_device(enc, device: str):

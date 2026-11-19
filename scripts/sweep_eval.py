@@ -13,7 +13,8 @@ train tokens, and the frozen-random-decoder run of phase 1n where it exists).
 
 ``--phase0`` adds the Stage 0.6 seeds 0-2 (fitted on all images) as setting ``phase0_alldata_d4096_k48``.
 ``--probes`` additionally runs ``stage0_metrics.py --protocol v1`` on the final checkpoints of the listed
-settings (P1.2 and selectivity).
+settings (P1.2 and selectivity, on the val split). ``--per-latent`` adds the per-latent check of protocol
+section 5 (``<out>/per_latent/``). ``--skip-sweep-metrics`` runs only those two, without the covariance.
 
 Results are cached per (setting, step) under ``<out>/cache``; a cached item is not recomputed unless
 ``--force``. Outputs: ``results.csv`` (tidy), ``pairs.csv``, ``fve.csv``, ``p11.csv``.
@@ -44,13 +45,14 @@ from medinterp.data.archive import DEFAULT_RUN_DIR
 from medinterp.data.manifests import DEFAULT_LABEL_DIR
 from medinterp.dictionaries.baselines import random_sae, signed_basis, signed_pca
 from medinterp.dictionaries.sae import TopKSAE
-from medinterp.eval.stability import TokenMoments
+from medinterp.eval.stability import TokenMoments, cosine_matrix, one_to_one
 from medinterp.eval.stats import complete_separation
-from medinterp.eval.sweep_metrics import (covariance_null, decoder_overlap, functional_null, functional_overlap,
-                                          load_eval_tokens, score_dictionary)
+from medinterp.eval.sweep_metrics import (covariance_null, decoder_overlap, firing_rates, functional_null,
+                                          functional_overlap, load_eval_tokens, score_dictionary)
 from medinterp.runinfo import write_config
 from medinterp.stage0_v1 import TIDY_COLUMNS, load_context, train_token_sample
-from medinterp.sweep import checkpoint_steps, overlap_share, seedsplit_base_rows, summarise_pairs
+from medinterp.sweep import (checkpoint_steps, overlap_share, per_latent_pair_table, seedsplit_base_rows,
+                             summarise_pairs, summarise_per_latent)
 
 REPO = Path(__file__).resolve().parents[1]
 ROOT = Path(os.environ.get("MEDINTERP_DATA", REPO))
@@ -252,7 +254,8 @@ def run_probes(settings: dict, names: list[str], args) -> None:
         info = settings[name]
         out = args.out / "probes" / name
         cmd = [sys.executable, str(REPO / "scripts/stage0_metrics.py"), "--protocol", "v1", "--out", str(out),
-               "--split-file", str(args.split_file), "--sae-fit-split", "train"]
+               "--split-file", str(args.split_file), "--sae-fit-split", "train", "--eval-split", EVAL_SPLIT,
+               "--run-dir", str(args.run_dir), "--label-dir", str(args.label_dir)]
         for r, rinfo in info["runs"].items():
             last = max(rinfo["steps"])
             cmd += ["--sae", f"{r}={rinfo['steps'][last]}"]
@@ -260,6 +263,34 @@ def run_probes(settings: dict, names: list[str], args) -> None:
             cmd[cmd.index("train")] = "all"
         log(f"probes {name}: {' '.join(cmd[2:])}")
         subprocess.run(cmd, check=True)
+
+
+def run_per_latent(settings: dict, tokens, device: str, out: Path, force: bool) -> None:
+    """Per-latent check (protocol section 5) at each setting's last common checkpoint: for every seed pair, each
+    latent's one-to-one partner, decoder cosine and image firing rates; a summary per setting."""
+    out.mkdir(parents=True, exist_ok=True)
+    for name, info in settings.items():
+        if info["meta"]["kind"] != "trained" or len(info["runs"]) < 2 or name == PHASE0:
+            continue
+        target = out / f"{name}_summary.json"
+        if target.exists() and not force:
+            continue
+        runs = info["runs"]
+        step = max(set.intersection(*(set(r["steps"]) for r in runs.values())))
+        order = sorted(runs, key=lambda r: (runs[r]["init_seed"], runs[r]["data_seed"]))
+        saes = {r: TopKSAE.from_checkpoint(runs[r]["steps"][step]) for r in order}
+        rates = {r: firing_rates(saes[r], tokens, device)[1] for r in order}
+        tables = []
+        for i, a in enumerate(order):
+            for b in order[i + 1:]:
+                cos, partner = one_to_one(cosine_matrix(saes[a].W_dec, saes[b].W_dec))
+                tables.append(per_latent_pair_table(cos, partner, rates[a], rates[b]).assign(run_a=a, run_b=b))
+        pd.concat(tables).to_csv(out / f"{name}_latents.csv.gz", index=False)
+        summary = {"setting": name, "d_sae": info["meta"]["d_sae"], "k": info["meta"]["k"], "step": step,
+                   **summarise_per_latent(tables, S_THRESHOLD)}
+        target.write_text(json.dumps(summary, indent=1, default=float))
+        log(f"per-latent {name} step {step}: S {summary['S_all']['mean']:.4f}, among live {summary['S_live']['mean']:.4f}, "
+            f"rate-cosine rho {summary['spearman_rate_cosine']['mean']:.3f}")
 
 
 def p11_table(fve: pd.DataFrame) -> pd.DataFrame:
@@ -302,6 +333,10 @@ def main() -> None:
                     help="skip functional matching above this size (its correlation matrix is d_sae^2 float64)")
     ap.add_argument("--probes", nargs="*", default=None, metavar="SETTING",
                     help="also run stage0_metrics.py v1 (P1.2, selectivity) on these settings' final checkpoints")
+    ap.add_argument("--per-latent", action="store_true",
+                    help="also run the per-latent check (protocol section 5) on the finished settings")
+    ap.add_argument("--skip-sweep-metrics", action="store_true",
+                    help="skip the per-setting sweep metrics and their aggregation (with --per-latent or --probes)")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -326,18 +361,20 @@ def main() -> None:
     tokens = None
     cov = None
 
-    def need_tokens():
+    def need_tokens(with_covariance: bool = True):
         nonlocal tokens, cov
         if tokens is None:
             log(f"loading {EVAL_SPLIT} tokens")
             tokens = load_eval_tokens(ctx.acts, ctx.masks, ctx.groups, EVAL_SPLIT)
             log(f"{tokens.n_images} images, {tokens.x.shape[0]} tokens")
+        if with_covariance and cov is None:
             cov = train_covariance(ctx, cache / "cov_train.pt")
         return tokens, cov
 
     if args.aggregate_only:
         settings = {}
-    for name, info in settings.items():
+    to_evaluate = {} if args.skip_sweep_metrics else settings
+    for name, info in to_evaluate.items():
         steps = sorted(set.intersection(*(set(r["steps"]) for r in info["runs"].values())))
         for step in steps:
             f = cache / name / f"step_{step}.json"
@@ -349,7 +386,7 @@ def main() -> None:
             f.write_text(json.dumps(res, indent=1, default=float))
 
     pca_sample = None
-    for d_sae, k in sorted({(v["meta"]["d_sae"], v["meta"]["k"]) for v in settings.values()
+    for d_sae, k in sorted({(v["meta"]["d_sae"], v["meta"]["k"]) for v in to_evaluate.values()
                             if v["meta"]["kind"] == "trained"}):
         f = cache / "nulls" / f"d{d_sae}_k{k}.json"
         if f.exists() and not args.force:
@@ -360,6 +397,14 @@ def main() -> None:
         res = evaluate_nulls(ctx, d_sae, k, tok, device, pca_sample)
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(json.dumps(res, indent=1, default=float))
+
+    if args.skip_sweep_metrics:
+        if args.per_latent:
+            run_per_latent(settings, need_tokens(with_covariance=False)[0], device, args.out / "per_latent", args.force)
+        if args.probes is not None:
+            run_probes(settings, args.probes or list(settings), args)
+        log(f"wrote {args.out}")
+        return
 
     fve, tidy_rows, pairs = [], [], []
     for f in sorted(cache.glob("*/*.json")):
@@ -376,6 +421,8 @@ def main() -> None:
         p11.to_csv(args.out / "p11.csv", index=False)
         if not p11.empty:
             log("P1.1 (val, exploratory):\n" + p11.to_string(index=False))
+    if args.per_latent and settings:
+        run_per_latent(settings, need_tokens(with_covariance=False)[0], device, args.out / "per_latent", args.force)
     if args.probes is not None:
         run_probes(settings, args.probes or list(settings), args)
     log(f"wrote {args.out}")

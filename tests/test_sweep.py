@@ -26,15 +26,26 @@ def test_table_phase_one_matches_protocol():
     assert (t[t.phase != "1n"].decoder == "trained").all()
 
 
-def test_phase_two_is_appended_without_renumbering():
-    base, full = sweep_table(), sweep_table(phase2=True)
-    assert len(base) == 58 and len(full) == 115
+def test_later_phases_are_appended_without_renumbering():
+    base, full = sweep_table(), sweep_table(full=True)
+    assert len(base) == 58 and len(full) == 125
     assert full.iloc[:len(base)].equals(base)
-    assert full.run_units.sum() == pytest.approx(91.75)
+    assert full.run_units.sum() == pytest.approx(94.25)
+    # Phase 2 was decided before phase 1c, so it keeps rows 58-114 and phase 1c follows.
+    assert set(full.iloc[58:115].phase) == {"2a", "2b", "2c", "2d"}
+    assert set(full.iloc[115:].phase) == {"1c"}
+
+
+def test_k_extension_matches_the_protocol_table():
+    ext = sweep_table(full=True).query("phase == '1c'")
+    assert set(zip(ext.d_sae, ext.k)) == {(1024, 64), (1024, 96)}
+    assert (ext.groupby("setting").size() == 5).all() and (ext.steps == 20_000).all()
+    assert (ext.init_seed == ext.data_seed).all() and ext.run_units.sum() == pytest.approx(2.5)
+    assert ext.checkpoints.eq("5000;10000;20000").all()
 
 
 def test_phase_two_matches_the_protocol_table():
-    full = sweep_table(phase2=True)
+    full = sweep_table(full=True)
     two = full[full.phase.str.startswith("2")]
     units = two.groupby("phase").run_units.sum()
     assert units.to_dict() == pytest.approx({"2a": 33.0, "2b": 1.5, "2c": 4.5, "2d": 4.5})
@@ -51,7 +62,7 @@ def test_phase_two_matches_the_protocol_table():
 
 
 def test_seedsplit_reuses_the_phase_one_runs_of_its_setting():
-    full = sweep_table(phase2=True)
+    full = sweep_table(full=True)
     base = seedsplit_base_rows(full, 1024, 16)
     assert base.run_id.tolist() == ["d1024_k16_s20000_i0_b0", "d1024_k16_s20000_i1_b1"]
     assert set(base.phase) == {"1b"}
@@ -63,6 +74,8 @@ def test_setting_roles():
     assert setting_role(4096, 48) == "dense reference"
     assert {setting_role(4096, k) for k in (4, 8, 16)} == {"appendix"}
     assert setting_role(1024, 48) == "appendix"
+    assert setting_role(1024, 64) == "dense reference" and setting_role(1024, 96) == "appendix"
+    assert setting_role(4096, 64) == "not carried forward"
     assert setting_role(1024, 4) == setting_role(16_384, 16) == "not carried forward"
 
 
@@ -185,3 +198,51 @@ def test_outcome_table_order():
     assert classify_outcome({"t": 0.09, "d4096_k4": 0.10}, "t", small, None, th) == "in between"
     assert classify_outcome({"t": 0.09, "d4096_k4": 0.10}, "t", small, {}, th) == "in between"
     assert classify_outcome({"t": 0.20, "d4096_k4": 0.10}, "t", small, flat, th) == "in between"
+
+
+def test_per_latent_pair_table_and_summary():
+    from medinterp.sweep import per_latent_pair_table, summarise_per_latent
+
+    cos = np.array([0.9, 0.8, 0.2, np.nan])
+    partner = np.array([1, 0, 2, -1])
+    rate_a = np.array([0.5, 0.3, 0.1, 0.0])           # the last latent never fires
+    rate_b = np.array([0.4, 0.6, 0.0])                # partner 2 never fires in run B
+    table = per_latent_pair_table(cos, partner, rate_a, rate_b)
+    assert table.image_rate_partner.tolist()[:3] == [0.6, 0.4, 0.0] and np.isnan(table.image_rate_partner[3])
+    summary = summarise_per_latent([table], threshold=0.7)
+    assert summary["S_all"]["mean"] == pytest.approx(0.5)          # 2 of 4 latents
+    assert summary["S_live"]["mean"] == pytest.approx(2 / 3)       # 2 of the 3 live latents
+    assert summary["recurring_live_in_both"]["mean"] == pytest.approx(1.0)
+    assert summary["spearman_rate_cosine"]["mean"] == pytest.approx(1.0)
+    assert summary["median_image_rate_recurring"] == pytest.approx(0.4)
+    assert summary["median_image_rate_not_recurring"] == pytest.approx(0.1)
+    with pytest.raises(ValueError):
+        per_latent_pair_table(cos, partner[:3], rate_a, rate_b)
+    with pytest.raises(ValueError):
+        summarise_per_latent([], 0.7)
+
+
+def _probe_summary(m1, m5):
+    trained = {f"run{i}": {"probe_mean_cross_auroc_m1": [a, 0, 1], "probe_mean_cross_auroc_m5": [b, 0, 1]}
+               for i, (a, b) in enumerate(zip(m1, m5))}
+    nulls = {"random_seed0": {"probe_mean_cross_auroc_m1": [0.5, 0, 1], "probe_mean_cross_auroc_m5": [0.5, 0, 1]},
+             "signed_pca": {"probe_mean_cross_auroc_m1": [0.6, 0, 1], "probe_mean_cross_auroc_m5": [0.6, 0, 1]}}
+    return {"dictionaries": {**trained, **nulls},
+            "trained_vs_null": {"probe_m1": {"best_null": "signed_pca", "separated": True, "gap": 0.1}}}
+
+
+def test_label_transfer_table_and_extension_rule():
+    from medinterp.sweep import extension_k_role, label_transfer_table
+
+    core = {"d1024_k8_s20000": (0.80, 0.82), "d1024_k16_s20000": (0.79, 0.83),
+            "d1024_k32_s20000": (0.78, 0.81), "d4096_k32_s20000": (0.77, 0.80)}
+    summaries = {s: _probe_summary([a, a], [b, b]) for s, (a, b) in core.items()}
+    summaries["d1024_k64_s20000"] = _probe_summary([0.81, 0.83], [0.85, 0.85])
+    table = label_transfer_table(summaries)
+    k64 = table.set_index("setting").loc["d1024_k64_s20000"]
+    assert k64.n_seeds == 2 and k64.m1_mean == pytest.approx(0.82) and k64.m1_best_null == "signed_pca"
+    assert extension_k_role(table) == "core"                     # above every core setting at m = 1 and 5
+    weaker = summaries | {"d1024_k64_s20000": _probe_summary([0.81, 0.81], [0.82, 0.82])}
+    assert extension_k_role(label_transfer_table(weaker)) == "dense reference"   # m = 5 not above k = 16
+    with pytest.raises(ValueError):
+        extension_k_role(table[table.k != 64])

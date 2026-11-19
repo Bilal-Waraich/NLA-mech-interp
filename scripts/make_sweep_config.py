@@ -1,10 +1,10 @@
 """Write the sweep's run table ``configs/sweep_v1.csv`` from the protocol's phase table (section 5).
 
-Without ``--phase2`` the table holds phases 1a, 1b and 1n. With it, the phase 2 rows of the settings carried
-forward are appended. Existing rows keep their row numbers, and a table whose rows differ from the
-regenerated ones is refused.
+Without ``--full`` the table holds phases 1a, 1b and 1n. With it, phase 2 and then phase 1c (the k extension)
+are appended. Existing rows keep their row numbers, and a table whose rows differ from the regenerated ones
+is refused.
 
-Run:  ~/.venvs/nla-mech-interp/bin/python scripts/make_sweep_config.py --phase2
+Run:  ~/.venvs/nla-mech-interp/bin/python scripts/make_sweep_config.py --full
 """
 from __future__ import annotations
 
@@ -27,10 +27,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, default=ROOT / "configs/sweep_v1.csv")
-    ap.add_argument("--phase2", action="store_true", help="append the phase 2 rows")
+    ap.add_argument("--full", action="store_true", help="append phase 2 and phase 1c")
     args = ap.parse_args()
 
-    table = sweep_table(phase2=args.phase2)
+    table = sweep_table(full=args.full)
     if args.out.exists():
         old = pd.read_csv(args.out)
         shared = table.iloc[:len(old)].reset_index(drop=True)

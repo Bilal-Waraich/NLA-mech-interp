@@ -79,7 +79,7 @@ def main() -> None:
         per_step[d_sae] = s
         print(f"d_sae {d_sae:>6} k {k:>2}: {1 / s:7.2f} steps/s  ({s * BASE_STEPS / 3600:.2f} h per 20k steps)",
               flush=True)
-    table = sweep_table(phase2=True)
+    table = sweep_table(full=True)
     hours = float(sum(r.steps * per_step[r.d_sae] for r in table.itertuples()) / 3600)
     result = {"label": args.label, "device": args.device, "platform": platform.platform(),
               "processor": platform.processor(), "cpu_count": os.cpu_count(),
