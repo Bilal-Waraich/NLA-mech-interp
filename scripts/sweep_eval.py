@@ -14,7 +14,8 @@ train tokens, and the frozen-random-decoder run of phase 1n where it exists).
 ``--phase0`` adds the Stage 0.6 seeds 0-2 (fitted on all images) as setting ``phase0_alldata_d4096_k48``.
 ``--probes`` additionally runs ``stage0_metrics.py --protocol v1`` on the final checkpoints of the listed
 settings (P1.2 and selectivity, on the val split). ``--per-latent`` adds the per-latent check of protocol
-section 5 (``<out>/per_latent/``). ``--skip-sweep-metrics`` runs only those two, without the covariance.
+section 5 (``<out>/per_latent/``). ``--subspace`` adds subspace reproducibility (``<out>/subspace/``). ``--skip-sweep-metrics`` runs only these
+additional checks.
 
 Results are cached per (setting, step) under ``<out>/cache``; a cached item is not recomputed unless
 ``--force``. Outputs: ``results.csv`` (tidy), ``pairs.csv``, ``fve.csv``, ``p11.csv``.
@@ -43,10 +44,12 @@ import torch
 
 from medinterp.data.archive import DEFAULT_RUN_DIR
 from medinterp.data.manifests import DEFAULT_LABEL_DIR
-from medinterp.dictionaries.baselines import random_sae, signed_basis, signed_pca
+from medinterp.dictionaries.baselines import covariance_directions, random_sae, signed_basis, signed_pca
 from medinterp.dictionaries.sae import TopKSAE
 from medinterp.eval.stability import TokenMoments, cosine_matrix, one_to_one
 from medinterp.eval.stats import complete_separation
+from medinterp.eval.subspace import (effective_rank, reappearance_probability, stability_sets,
+                                     subspace_explained_variance)
 from medinterp.eval.sweep_metrics import (covariance_null, decoder_overlap, firing_rates, functional_null,
                                           functional_overlap, load_eval_tokens, score_dictionary)
 from medinterp.runinfo import write_config
@@ -66,6 +69,9 @@ RANDOM_SAE_SEEDS = (0, 1, 2, 3, 4)
 PCA_TOKENS_PER_DATASET = 50_000
 SEED = 0
 PHASE0 = "phase0_alldata_d4096_k48"
+# Protocol section 5, subspace reproducibility: endpoint cutoff and the ranks of the compared subspaces.
+SUBSPACE_EPSILON = 0.05
+SUBSPACE_RANKS = (8, 16, 32, 64, 128)
 
 
 def log(msg: str) -> None:
@@ -293,6 +299,60 @@ def run_per_latent(settings: dict, tokens, device: str, out: Path, force: bool) 
             f"rate-cosine rho {summary['spearman_rate_cosine']['mean']:.3f}")
 
 
+def run_subspace(settings: dict, tokens, cov, device: str, out: Path, force: bool) -> None:
+    """Subspace reproducibility (protocol section 5) at each setting's last common checkpoint: every seed is
+    an anchor; its unstable and stable latents (among those that fire on val) are compared with each other
+    seed's, and the unstable sets also with covariance-shaped random directions of the same count."""
+    out.mkdir(parents=True, exist_ok=True)
+    for name, info in settings.items():
+        if info["meta"]["kind"] != "trained" or len(info["runs"]) < 3 or name == PHASE0:
+            continue
+        target = out / f"{name}.json"
+        if target.exists() and not force:
+            continue
+        runs = info["runs"]
+        step = max(set.intersection(*(set(r["steps"]) for r in runs.values())))
+        order = sorted(runs, key=lambda r: (runs[r]["init_seed"], runs[r]["data_seed"]))
+        saes = {r: TopKSAE.from_checkpoint(runs[r]["steps"][step]) for r in order}
+        live = {r: firing_rates(saes[r], tokens, device)[1] > 0 for r in order}
+        decs = {r: saes[r].W_dec.float() for r in order}
+        sets, per_seed = {}, []
+        for r in order:
+            p = reappearance_probability(decs[r], [decs[o] for o in order if o != r], S_THRESHOLD)
+            unstable, stable = stability_sets(p, SUBSPACE_EPSILON, live[r])
+            sets[r] = (unstable, stable)
+            d = decs[r].shape[1]
+            per_seed.append({"run": r, "n_live": int(live[r].sum()), "n_unstable": len(unstable), "n_stable": len(stable),
+                             "er_ratio_unstable": effective_rank(decs[r][unstable]) / d if len(unstable) else None,
+                             "er_ratio_stable": effective_rank(decs[r][stable]) / d if len(stable) else None})
+        pairs = []
+        for a in order:
+            for s in order:
+                if a == s:
+                    continue
+                row = {"anchor": a, "other": s}
+                for kind, i in (("unstable", 0), ("stable", 1)):
+                    if len(sets[a][i]) and len(sets[s][i]):
+                        ev = subspace_explained_variance(decs[a][sets[a][i]], decs[s][sets[s][i]], SUBSPACE_RANKS)
+                        row.update({f"{kind}_r{r}": v for r, v in ev.items()})
+                if len(sets[a][0]) and len(sets[s][0]):
+                    null = covariance_directions(cov, len(sets[s][0]), seed=SEED)
+                    ev = subspace_explained_variance(decs[a][sets[a][0]], null.float(), SUBSPACE_RANKS)
+                    row.update({f"null_r{r}": v for r, v in ev.items()})
+                pairs.append(row)
+        pair_table = pd.DataFrame(pairs)
+        pair_table.to_csv(out / f"{name}_pairs.csv", index=False)
+        summary = {"setting": name, "d_sae": info["meta"]["d_sae"], "k": info["meta"]["k"], "step": step,
+                   "epsilon": SUBSPACE_EPSILON, "per_seed": per_seed,
+                   "mean_explained_variance": {c: float(pair_table[c].mean()) for c in pair_table.columns
+                                               if c not in ("anchor", "other")}}
+        target.write_text(json.dumps(summary, indent=1, default=float))
+        ev = summary["mean_explained_variance"]
+        log(f"subspace {name}: unstable {np.mean([p['n_unstable'] for p in per_seed]):.0f} latents, "
+            + ", ".join(f"r{r}: {ev.get(f'unstable_r{r}', float('nan')):.3f} vs null {ev.get(f'null_r{r}', float('nan')):.3f}"
+                        for r in SUBSPACE_RANKS))
+
+
 def p11_table(fve: pd.DataFrame) -> pd.DataFrame:
     """P1.1 per (d_sae, k) at the final 20k checkpoint of phase-1 settings: trained seeds vs every null."""
     rows = []
@@ -335,6 +395,8 @@ def main() -> None:
                     help="also run stage0_metrics.py v1 (P1.2, selectivity) on these settings' final checkpoints")
     ap.add_argument("--per-latent", action="store_true",
                     help="also run the per-latent check (protocol section 5) on the finished settings")
+    ap.add_argument("--subspace", action="store_true",
+                    help="also run the subspace-reproducibility check (protocol section 5) on the finished settings")
     ap.add_argument("--skip-sweep-metrics", action="store_true",
                     help="skip the per-setting sweep metrics and their aggregation (with --per-latent or --probes)")
     ap.add_argument("--force", action="store_true")
@@ -401,6 +463,9 @@ def main() -> None:
     if args.skip_sweep_metrics:
         if args.per_latent:
             run_per_latent(settings, need_tokens(with_covariance=False)[0], device, args.out / "per_latent", args.force)
+        if args.subspace:
+            tok, cv = need_tokens()
+            run_subspace(settings, tok, cv, device, args.out / "subspace", args.force)
         if args.probes is not None:
             run_probes(settings, args.probes or list(settings), args)
         log(f"wrote {args.out}")
@@ -423,6 +488,9 @@ def main() -> None:
             log("P1.1 (val, exploratory):\n" + p11.to_string(index=False))
     if args.per_latent and settings:
         run_per_latent(settings, need_tokens(with_covariance=False)[0], device, args.out / "per_latent", args.force)
+    if args.subspace and settings:
+        tok, cv = need_tokens()
+        run_subspace(settings, tok, cv, device, args.out / "subspace", args.force)
     if args.probes is not None:
         run_probes(settings, args.probes or list(settings), args)
     log(f"wrote {args.out}")
