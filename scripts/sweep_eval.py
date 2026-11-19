@@ -50,7 +50,7 @@ from medinterp.eval.sweep_metrics import (covariance_null, decoder_overlap, func
                                           load_eval_tokens, score_dictionary)
 from medinterp.runinfo import write_config
 from medinterp.stage0_v1 import TIDY_COLUMNS, load_context, train_token_sample
-from medinterp.sweep import checkpoint_steps, overlap_share, summarise_pairs
+from medinterp.sweep import checkpoint_steps, overlap_share, seedsplit_base_rows, summarise_pairs
 
 REPO = Path(__file__).resolve().parents[1]
 ROOT = Path(os.environ.get("MEDINTERP_DATA", REPO))
@@ -86,9 +86,8 @@ def collect_settings(table: pd.DataFrame, runs_root: Path, phase0_dir: Path | No
         runs = {}
         rows = list(part.itertuples())
         if first.phase == "2b":
-            # The 2 x 2 design reuses the phase 1a runs (0, 0) and (1, 1) of the headline setting.
-            base = table[(table.phase == "1a") & (table.k == first.k) & (table.d_sae == first.d_sae)]
-            rows = [r for r in base.itertuples() if (r.init_seed, r.data_seed) in ((0, 0), (1, 1))] + rows
+            # The 2 x 2 design reuses the phase 1 runs (0, 0) and (1, 1) of the same setting.
+            rows = list(seedsplit_base_rows(table, int(first.d_sae), int(first.k)).itertuples()) + rows
         if not all((runs_root / r.run_id / "DONE.json").exists() for r in rows):
             continue
         for r in rows:

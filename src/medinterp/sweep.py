@@ -2,13 +2,13 @@
 
 Run table (``configs/sweep_v1.csv``): one row per training run, generated from the protocol's phase table
 by ``sweep_table``. A *setting* is a group of runs that differ only in their seeds; stability is measured
-between the runs of one setting. Phase 2 rows need the headline k and are added once it is fixed.
+between the runs of one setting. Phase 2 rows are appended for the settings the protocol carries forward.
 
 Two deliberate readings of the phase table (also in the WP1 notes):
-  2b   the 2 x 2 design of initialisation seed x batch-order seed reuses the phase 1a runs (0, 0) and
-       (1, 1), so only (0, 1) and (1, 0) are new runs.
-  1n   the frozen-random-decoder null of P1.1 (Korznikov) is trained once per k at 4,096 latents, so the
-       headline rule ("largest FVE gap to the best null") sees every null the protocol lists.
+  2b   the 2 x 2 design of initialisation seed x batch-order seed reuses the phase 1 runs (0, 0) and
+       (1, 1) of the same setting, so only (0, 1) and (1, 0) are new runs.
+  1n   the frozen-random-decoder null of P1.1 (Korznikov) is trained once per k at 4,096 latents, so
+       P1.1 sees every null the protocol lists.
 
 Runs are trained on train-split tokens only. A run directory holds ``step_<n>/`` checkpoints (TopKSAE
 format), ``config.json``, ``train.log``, ``state.pt`` while unfinished and ``DONE.json`` when finished.
@@ -22,7 +22,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -39,6 +39,24 @@ BASE_D_SAE = 4096
 BASE_STEPS = 20_000
 BASE_L1 = TrainConfig().l1_coeff
 BASE_CHECKPOINTS = (5_000, 10_000, 20_000)
+LONG_STEPS = 80_000
+LONG_CHECKPOINTS = (20_000, 40_000, 80_000)
+
+# Settings carried forward, as (d_sae, k); roles and rules are in protocol section 5.
+CORE_SETTINGS = ((1024, 8), (1024, 16), (1024, 32), (4096, 32))
+DENSE_REFERENCE = (4096, 48)
+APPENDIX_SETTINGS = ((1024, 48), (4096, 4), (4096, 8), (4096, 16))
+PHASE2_ALL_TESTS = ((1024, 8), (1024, 16), (1024, 32))
+PHASE2_TRAINING_LENGTH_ONLY = ((4096, 32), (4096, 48))
+
+
+def setting_role(d_sae: int, k: int) -> str:
+    """Role of a (d_sae, k) pair: "core", "dense reference", "appendix" or "not carried forward"."""
+    if (d_sae, k) in CORE_SETTINGS:
+        return "core"
+    if (d_sae, k) == DENSE_REFERENCE:
+        return "dense reference"
+    return "appendix" if (d_sae, k) in APPENDIX_SETTINGS else "not carried forward"
 
 
 def run_units(d_sae: int, steps: int) -> float:
@@ -62,11 +80,28 @@ def _row(phase: str, d_sae: int, k: int, init_seed: int, data_seed: int, *, step
             "checkpoints": ";".join(str(c) for c in checkpoints), "run_units": run_units(d_sae, steps)}
 
 
-def sweep_table(headline_k: int | None = None) -> pd.DataFrame:
-    """The run table. Without ``headline_k`` only phases 1a, 1b and 1n; with it, phase 2 as well.
+def _training_length_rows(d_sae: int, k: int) -> list[dict]:
+    """Phase 2a at one setting: three seeds trained for the long schedule."""
+    return [_row("2a", d_sae, k, s, s, steps=LONG_STEPS, checkpoints=LONG_CHECKPOINTS) for s in range(3)]
 
+
+def _other_phase2_rows(d_sae: int, k: int) -> list[dict]:
+    """Phases 2b, 2c and 2d at one setting."""
+    # The 2 x 2 design shares its (0, 0) and (1, 1) cells with phase 1; see the module docstring.
+    seedsplit = setting_name(d_sae, k, BASE_STEPS, "seedsplit")
+    rows = [_row("2b", d_sae, k, i, b, setting=seedsplit) for i, b in ((0, 1), (1, 0))]
+    for frac, tag in ((0.25, "frac25"), (0.5, "frac50")):
+        rows += [_row("2c", d_sae, k, s, s, data_fraction=frac, variant=tag) for s in range(3)]
+    rows += [_row("2d", d_sae, k, s, s, l1_coeff=0.0, variant="l1off") for s in range(3)]
+    rows += [_row("2d", d_sae, k, s, s, sampling="proportional", variant="prop") for s in range(3)]
+    return rows
+
+
+def sweep_table(phase2: bool = False) -> pd.DataFrame:
+    """The run table: phases 1a, 1b and 1n, followed by phase 2 if ``phase2`` is true.
+
+    Phase 2 rows only follow the phase 1 rows, so row numbers of finished runs never change.
     Seeds: a phase-1 seed s sets both the initialisation and the batch order (as the Stage 0.6 seeds did).
-    Raises ValueError if ``headline_k`` is not one of the phase 1 values of k.
     """
     rows = []
     for k in PHASE1_KS:
@@ -76,19 +111,11 @@ def sweep_table(headline_k: int | None = None) -> pd.DataFrame:
     rows += [_row("1b", 16_384, 16, s, s) for s in range(3)]
     for k in PHASE1_KS:
         rows.append(_row("1n", BASE_D_SAE, k, 0, 0, decoder="frozen_isotropic", variant="frozeniso"))
-    if headline_k is not None:
-        if headline_k not in PHASE1_KS:
-            raise ValueError(f"headline_k must be one of {PHASE1_KS}, got {headline_k}")
-        h = headline_k
-        rows += [_row("2a", BASE_D_SAE, h, s, s, steps=80_000, checkpoints=(20_000, 40_000, 80_000))
-                 for s in range(3)]
-        # The 2 x 2 design shares its (0, 0) and (1, 1) cells with phase 1a; see the module docstring.
-        seedsplit = setting_name(BASE_D_SAE, h, BASE_STEPS, "seedsplit")
-        rows += [_row("2b", BASE_D_SAE, h, i, b, setting=seedsplit) for i, b in ((0, 1), (1, 0))]
-        for frac, tag in ((0.25, "frac25"), (0.5, "frac50")):
-            rows += [_row("2c", BASE_D_SAE, h, s, s, data_fraction=frac, variant=tag) for s in range(3)]
-        rows += [_row("2d", BASE_D_SAE, h, s, s, l1_coeff=0.0, variant="l1off") for s in range(3)]
-        rows += [_row("2d", BASE_D_SAE, h, s, s, sampling="proportional", variant="prop") for s in range(3)]
+    if phase2:
+        for d_sae, k in PHASE2_ALL_TESTS:
+            rows += _training_length_rows(d_sae, k) + _other_phase2_rows(d_sae, k)
+        for d_sae, k in PHASE2_TRAINING_LENGTH_ONLY:
+            rows += _training_length_rows(d_sae, k)
     table = pd.DataFrame(rows)
     table.insert(0, "row", np.arange(len(table)))
     if not table.run_id.is_unique:
@@ -112,6 +139,12 @@ def parse_rows(spec: str, n_rows: int) -> list[int]:
 
 def checkpoint_steps(row) -> tuple[int, ...]:
     return tuple(int(c) for c in str(row["checkpoints"]).split(";") if c)
+
+
+def seedsplit_base_rows(table: pd.DataFrame, d_sae: int, k: int) -> pd.DataFrame:
+    """The phase 1 runs (0, 0) and (1, 1) that complete the 2 x 2 design of phase 2b at one setting."""
+    base = table[table.phase.isin(("1a", "1b")) & (table.d_sae == d_sae) & (table.k == k)]
+    return base[[(i, b) in ((0, 0), (1, 1)) for i, b in zip(base.init_seed, base.data_seed)]]
 
 
 # ---------------------------------------------------------------- training data
@@ -256,39 +289,71 @@ def summarise_pairs(values: Iterable[float]) -> dict:
     return {"mean": float(v.mean()), "min": float(v.min()), "max": float(v.max()), "n_pairs": int(v.size)}
 
 
-def headline_k(fve: pd.DataFrame) -> tuple[int, pd.DataFrame]:
-    """The protocol's headline rule: at 4,096 latents, the k with the largest val FVE gap between the
-    trained SAE and its best null.
+def p11_supported(p11: pd.DataFrame, margin: float, max_k: int) -> bool:
+    """P1.1 (protocol section 4): complete separation and the margin at every evaluated setting with k <= ``max_k``.
 
-    ``fve`` has columns ``k, dictionary_kind, dictionary, value`` (own-decoder FVE on val, phase 1a
-    settings plus the nulls at the same k). The trained side of the gap is the worst trained seed, so the
-    gap is the complete-separation gap of P1.1. Returns (k, table of gaps per k).
-    Raises ValueError if some k lacks trained runs or nulls.
+    ``p11`` has columns ``k, gap, separated``, one row per evaluated setting; appendix settings count.
+    Raises ValueError if no setting has k <= ``max_k``.
+    """
+    decisive = p11[p11.k <= max_k]
+    if decisive.empty:
+        raise ValueError(f"no evaluated setting has k <= {max_k}")
+    return bool(decisive.separated.astype(bool).all() and (decisive.gap >= margin).all())
+
+
+def training_length_table(curve: pd.DataFrame) -> pd.DataFrame:
+    """Phase 2a per setting: S of the 80k runs against S of the 20k runs of phase 1.
+
+    ``curve`` has columns ``setting, steps, S_mean``. The 80k runs' own 20k checkpoint sits halfway through
+    a longer learning-rate schedule, so it is listed but does not enter ``delta``. Settings whose 80k or
+    20k runs have not been evaluated are left out.
+    """
+    S = {(r.setting, int(r.steps)): float(r.S_mean) for r in curve.itertuples()}
+    rows = []
+    for d_sae, k in PHASE2_ALL_TESTS + PHASE2_TRAINING_LENGTH_ONLY:
+        short, long = setting_name(d_sae, k, BASE_STEPS), setting_name(d_sae, k, LONG_STEPS)
+        if (short, BASE_STEPS) not in S or (long, LONG_STEPS) not in S:
+            continue
+        rows.append({"setting": short, "d_sae": d_sae, "k": k, "role": setting_role(d_sae, k),
+                     "S_20k_run": S[short, BASE_STEPS], "S_80k_run": S[long, LONG_STEPS],
+                     "S_80k_run_at_20k": S.get((long, BASE_STEPS), math.nan),
+                     "delta": S[long, LONG_STEPS] - S[short, BASE_STEPS]})
+    return pd.DataFrame(rows, columns=["setting", "d_sae", "k", "role", "S_20k_run", "S_80k_run",
+                                       "S_80k_run_at_20k", "delta"])
+
+
+def summarise_decoder_diagnostic(runs: pd.DataFrame, fve: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Decoder pairwise cosine per setting (protocol section 5): mean and min-max over seeds, with the role.
+
+    ``runs`` has columns ``d_sae, k, step, c_dec``, one row per run. ``fve`` (columns ``d_sae, k, step,
+    dictionary_kind, n_dead``) adds the mean number of latents dead on val, because the decoders of dead
+    latents stay near their initial directions and pull the metric down.
     """
     rows = []
-    for k, part in fve.groupby("k"):
-        trained = part[part.dictionary_kind == "trained"]
-        nulls = part[part.dictionary_kind != "trained"]
-        if trained.empty or nulls.empty:
-            raise ValueError(f"k = {k}: need trained runs and nulls")
-        best = nulls.loc[nulls.value.idxmax()]
-        rows.append({"k": int(k), "worst_trained": float(trained.value.min()), "n_trained": len(trained),
-                     "best_null": best.dictionary, "best_null_value": float(best.value),
-                     "gap": float(trained.value.min() - best.value)})
-    gaps = pd.DataFrame(rows).sort_values("k").reset_index(drop=True)
-    return int(gaps.loc[gaps.gap.idxmax(), "k"]), gaps
+    for (d_sae, k, step), part in runs.groupby(["d_sae", "k", "step"]):
+        row = {"setting": setting_name(int(d_sae), int(k), BASE_STEPS), "d_sae": int(d_sae), "k": int(k),
+               "role": setting_role(int(d_sae), int(k)), "step": int(step), "n_runs": len(part),
+               "c_dec_mean": float(part.c_dec.mean()), "c_dec_min": float(part.c_dec.min()),
+               "c_dec_max": float(part.c_dec.max())}
+        if fve is not None:
+            trained = fve[(fve.d_sae == d_sae) & (fve.k == k) & (fve.step == step)
+                          & (fve.dictionary_kind == "trained")
+                          & (fve.setting == setting_name(int(d_sae), int(k), BASE_STEPS))]
+            row["mean_dead_on_val"] = float(trained.n_dead.mean()) if len(trained) else math.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def classify_outcome(S_by_setting: dict[str, float], thesis_setting: str, small_settings: list[str],
-                     under_training_delta: float | None, thresholds: dict[str, float]) -> str:
+                     under_training_deltas: Mapping[str, float] | None, thresholds: dict[str, float]) -> str:
     """Return "operating point", "under-training", "robust low" or "in between" (protocol section 5).
 
     Parameters:
-      S_by_setting         mean S per setting name (all settings that were run)
-      thesis_setting       the k = 48 / 4,096 setting
-      small_settings       the settings at k <= 16 or 1,024 latents
-      under_training_delta S(80k) - S(20k) at the headline setting, or None if not run yet
-      thresholds           ``high``, ``low`` and ``under_training`` from the protocol table
+      S_by_setting          mean S per setting name (all settings that were run)
+      thesis_setting        the k = 48 / 4,096 setting
+      small_settings        the settings at k <= 16 or 1,024 latents
+      under_training_deltas S(80k) - S(20k) per phase 2a setting; None or empty until phase 2a is complete
+      thresholds            ``high``, ``low`` and ``under_training`` from the protocol table
     Rows are checked in the table's order; an earlier row that applies wins. Raises KeyError if the
     thesis setting has no S.
     """
@@ -296,9 +361,9 @@ def classify_outcome(S_by_setting: dict[str, float], thesis_setting: str, small_
     thesis = S_by_setting[thesis_setting]
     if any(S_by_setting.get(s, -math.inf) >= hi for s in small_settings) and thesis < lo:
         return "operating point"
-    if under_training_delta is not None and under_training_delta >= ut:
+    if under_training_deltas and any(delta >= ut for delta in under_training_deltas.values()):
         return "under-training"
-    if under_training_delta is not None and all(v < lo for v in S_by_setting.values()):
+    if under_training_deltas and all(v < lo for v in S_by_setting.values()):
         return "robust low"
     return "in between"
 

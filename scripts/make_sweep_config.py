@@ -1,12 +1,10 @@
 """Write the sweep's run table ``configs/sweep_v1.csv`` from the protocol's phase table (section 5).
 
-Without ``--headline`` the table holds phases 1a, 1b and 1n. Once ``scripts/sweep_report.py`` has fixed
-the headline setting (``results/sweep_v1/headline.json``), run again with ``--headline`` to append phase 2.
-Existing rows keep their row numbers: phase 2 rows are only appended, and a table whose phase-1 rows
-differ from the regenerated ones is refused.
+Without ``--phase2`` the table holds phases 1a, 1b and 1n. With it, the phase 2 rows of the settings carried
+forward are appended. Existing rows keep their row numbers, and a table whose rows differ from the
+regenerated ones is refused.
 
-Run:  ~/.venvs/nla-mech-interp/bin/python scripts/make_sweep_config.py
-      ~/.venvs/nla-mech-interp/bin/python scripts/make_sweep_config.py --headline results/sweep_v1/headline.json
+Run:  ~/.venvs/nla-mech-interp/bin/python scripts/make_sweep_config.py --phase2
 """
 from __future__ import annotations
 
@@ -17,7 +15,6 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "src"))
 
 import argparse
-import json
 from pathlib import Path
 
 import pandas as pd
@@ -30,11 +27,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, default=ROOT / "configs/sweep_v1.csv")
-    ap.add_argument("--headline", type=Path, help="headline.json written by sweep_report.py")
+    ap.add_argument("--phase2", action="store_true", help="append the phase 2 rows")
     args = ap.parse_args()
 
-    k = json.loads(args.headline.read_text())["headline_k"] if args.headline else None
-    table = sweep_table(k)
+    table = sweep_table(phase2=args.phase2)
     if args.out.exists():
         old = pd.read_csv(args.out)
         shared = table.iloc[:len(old)].reset_index(drop=True)

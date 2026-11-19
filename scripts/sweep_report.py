@@ -1,15 +1,13 @@
-"""Sweep report (protocol section 5): headline setting, stability curve, outcome row.
+"""Sweep report (protocol section 5): P1.1 per setting, stability curve, training length, outcome row.
 
-1. Headline setting. Chosen from the val FVE table alone (``fve.csv``; the stability numbers are not read
-   for this step): at 4,096 latents, the k with the largest gap between the worst trained seed and the
-   best null. It is written once to ``<sweep>/headline.json`` and never changed: if the file exists, it is
-   used as it is, and a recomputation that disagrees is reported but does not replace it.
+1. P1.1 per evaluated setting with its role (``p11_by_setting.csv``), on val and therefore exploratory.
 2. Stability curve: S (mean, min-max over seed pairs) for every setting and checkpoint
    (``stability_curve.csv``, plus ``stability_curve.png`` if matplotlib is installed).
-3. Outcome: which row of the protocol's outcome table applies, with the inputs that decided it.
-   Training length is judged by S of the 80k runs (phase 2a) against S of the 20k runs at the headline
-   setting (phase 1a): the 80k runs' own 20k checkpoint sits halfway through a longer learning-rate
-   schedule and is reported alongside, not used.
+3. Training length per phase 2a setting (``training_length.csv``): S of the 80k runs against S of the 20k
+   runs of phase 1. The 80k runs' own 20k checkpoint sits halfway through a longer learning-rate schedule
+   and is listed alongside, not used.
+4. Outcome: which row of the protocol's outcome table applies, with the inputs that decided it. The training
+   length result is reported next to the row whichever row applies.
 
 Run:  ~/.venvs/nla-mech-interp/bin/python scripts/sweep_report.py
 """
@@ -29,27 +27,17 @@ from pathlib import Path
 
 import pandas as pd
 
-from medinterp.sweep import BASE_D_SAE, BASE_STEPS, PHASE1_KS, classify_outcome, headline_k, setting_name
+from medinterp.sweep import (BASE_STEPS, DENSE_REFERENCE, PHASE2_ALL_TESTS, PHASE2_TRAINING_LENGTH_ONLY,
+                             classify_outcome, p11_supported, setting_name, setting_role,
+                             training_length_table)
 
 REPO = Path(__file__).resolve().parents[1]
 ROOT = Path(os.environ.get("MEDINTERP_DATA", REPO))
-# Protocol section 5, outcome table.
+# Protocol sections 4 and 5.
+P11_MARGIN, P11_MAX_K = 0.02, 16
 OUTCOME_THRESHOLDS = {"high": 0.30, "low": 0.15, "under_training": 0.10}
-THESIS_K = 48
-
-
-def fve_for_headline(fve: pd.DataFrame) -> pd.DataFrame | None:
-    """Rows the headline rule needs, or None while any k still lacks its trained runs or nulls."""
-    parts = []
-    for k in PHASE1_KS:
-        s = setting_name(BASE_D_SAE, k, BASE_STEPS)
-        trained = fve[(fve.setting == s) & (fve.step == BASE_STEPS)]
-        nulls = fve[(fve.setting == f"nulls_d{BASE_D_SAE}_k{k}")
-                    | ((fve.setting == f"{s}_frozeniso") & (fve.step == BASE_STEPS))]
-        if len(trained) < 5 or nulls.empty:
-            return None
-        parts += [trained, nulls]
-    return pd.concat(parts)[["k", "dictionary_kind", "dictionary", "value"]]
+OUTCOME_SMALL_MAX_K, OUTCOME_SMALL_D_SAE = 16, 1024
+N_PHASE1_SETTINGS = 11
 
 
 def main() -> None:
@@ -57,27 +45,16 @@ def main() -> None:
     ap.add_argument("--sweep", type=Path, default=ROOT / "results/sweep_v1")
     args = ap.parse_args()
     ev = args.sweep / "eval"
-    fve = pd.read_csv(ev / "fve.csv")
     report: dict = {"generated": time.strftime("%Y-%m-%dT%H:%M:%S")}
 
-    # 1. Headline setting (FVE only).
-    head_file = args.sweep / "headline.json"
-    rows = fve_for_headline(fve)
-    if rows is not None:
-        k, gaps = headline_k(rows)
-        if head_file.exists():
-            fixed = json.loads(head_file.read_text())
-            if fixed["headline_k"] != k:
-                print(f"note: recomputed headline k = {k} differs from the fixed k = {fixed['headline_k']}; "
-                      f"the fixed value stays")
-        else:
-            head_file.write_text(json.dumps({"headline_k": k, "d_sae": BASE_D_SAE, "steps": BASE_STEPS,
-                                             "rule": "largest val FVE gap, worst trained seed minus best null",
-                                             "gaps": gaps.to_dict("records"),
-                                             "fixed_at": report["generated"]}, indent=2))
-            print(f"headline setting fixed: k = {k}")
-        report["fve_gaps"] = gaps.to_dict("records")
-    report["headline"] = json.loads(head_file.read_text()) if head_file.exists() else None
+    # 1. P1.1 per setting.
+    p11_file = ev / "p11.csv"
+    if p11_file.exists():
+        p11 = pd.read_csv(p11_file)
+        p11.insert(2, "role", [setting_role(d, k) for d, k in zip(p11.d_sae, p11.k)])
+        p11.to_csv(args.sweep / "p11_by_setting.csv", index=False)
+        report["p11"] = {"split": "val", "supported": p11_supported(p11, P11_MARGIN, P11_MAX_K),
+                         "settings": p11.to_dict("records")}
 
     # 2. Stability curve.
     res = pd.read_csv(ev / "results.csv")
@@ -85,32 +62,32 @@ def main() -> None:
     curve = S[["dictionary", "d_sae", "k", "steps", "value", "ci_low", "ci_high"]].rename(
         columns={"dictionary": "setting", "value": "S_mean", "ci_low": "S_min", "ci_high": "S_max"})
     curve = curve.sort_values(["d_sae", "k", "setting", "steps"]).reset_index(drop=True)
+    curve.insert(3, "role", [setting_role(d, k) for d, k in zip(curve.d_sae, curve.k)])
     curve.to_csv(args.sweep / "stability_curve.csv", index=False)
     report["curve"] = curve.to_dict("records")
     _plot(curve, args.sweep / "stability_curve.png")
 
-    # 3. Outcome row.
-    final = curve[curve.steps == BASE_STEPS].set_index("setting").S_mean.to_dict()
-    phase1 = {s: v for s, v in final.items() if s.count("_") == 2 and s.startswith("d")}
-    thesis = setting_name(BASE_D_SAE, THESIS_K, BASE_STEPS)
-    small = [s for s in phase1 if int(s.split("_k")[1].split("_")[0]) <= 16 or s.startswith("d1024_")]
-    delta = None
-    if report["headline"]:
-        h = report["headline"]["headline_k"]
-        long_s = curve[(curve.setting == setting_name(BASE_D_SAE, h, 80_000))]
-        base_s = final.get(setting_name(BASE_D_SAE, h, BASE_STEPS))
-        at80 = long_s[long_s.steps == 80_000].S_mean
-        if len(at80) and base_s is not None:
-            delta = float(at80.iloc[0] - base_s)
-            report["training_length"] = {"S_80k": float(at80.iloc[0]), "S_20k_run": base_s,
-                                         "S_80k_run_at_20k": long_s[long_s.steps == 20_000].S_mean.tolist()}
+    # 3. Training length per phase 2a setting.
+    training = training_length_table(curve)
+    training.to_csv(args.sweep / "training_length.csv", index=False)
+    report["training_length"] = training.to_dict("records")
+    training_complete = len(training) == len(PHASE2_ALL_TESTS + PHASE2_TRAINING_LENGTH_ONLY)
+
+    # 4. Outcome row. Only the 20k settings of phase 1 enter it: the 80k runs also have a 20k checkpoint.
+    at_base = curve[(curve.steps == BASE_STEPS) & curve.setting.str.fullmatch(rf"d\d+_k\d+_s{BASE_STEPS}")]
+    phase1 = at_base.set_index("setting").S_mean.to_dict()
+    thesis = setting_name(*DENSE_REFERENCE, BASE_STEPS)
+    small = at_base[(at_base.k <= OUTCOME_SMALL_MAX_K) | (at_base.d_sae == OUTCOME_SMALL_D_SAE)].setting.tolist()
+    deltas = training.set_index("setting").delta.to_dict() if training_complete else None
     if thesis in phase1:
-        report["outcome"] = {"row": classify_outcome(phase1, thesis, small, delta, OUTCOME_THRESHOLDS),
+        report["outcome"] = {"row": classify_outcome(phase1, thesis, small, deltas, OUTCOME_THRESHOLDS),
                              "S_thesis_setting": phase1[thesis], "small_settings": {s: phase1[s] for s in small},
-                             "under_training_delta": delta, "thresholds": OUTCOME_THRESHOLDS,
-                             "complete": delta is not None and len(phase1) == 11}
+                             "under_training_deltas": deltas, "thresholds": OUTCOME_THRESHOLDS,
+                             "complete": training_complete and len(phase1) == N_PHASE1_SETTINGS}
     (args.sweep / "report.json").write_text(json.dumps(report, indent=2, default=float))
-    print(json.dumps({k: report.get(k) for k in ("headline", "outcome")}, indent=2, default=float))
+    print(json.dumps({k: report.get(k) for k in ("outcome", "training_length")}, indent=2, default=float))
+    if "p11" in report:
+        print(f"P1.1 on val (exploratory): supported = {report['p11']['supported']}")
 
 
 def _plot(curve: pd.DataFrame, path: Path) -> None:
@@ -120,7 +97,7 @@ def _plot(curve: pd.DataFrame, path: Path) -> None:
         import matplotlib.pyplot as plt
     except ImportError:
         return
-    final = curve[(curve.steps == BASE_STEPS) & curve.setting.str.match(r"^d\d+_k\d+_s20000$")]
+    final = curve[(curve.steps == BASE_STEPS) & curve.setting.str.fullmatch(rf"d\d+_k\d+_s{BASE_STEPS}")]
     if final.empty:
         return
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -130,7 +107,7 @@ def _plot(curve: pd.DataFrame, path: Path) -> None:
                     marker="o", capsize=3, label=f"{d_sae} latents")
     ax.set_xscale("log", base=2)
     ax.set_xlabel("k (active latents per token)")
-    ax.set_ylabel("S: share of latents with a partner at cosine >= 0.7")
+    ax.set_ylabel("S: share of latents with a recurring partner")
     ax.set_title("Seed overlap of decoder directions, 20k steps, SAEs fitted on train")
     ax.legend()
     fig.tight_layout()

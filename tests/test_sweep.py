@@ -1,4 +1,4 @@
-"""Sweep run table, data subsets, resumable runs, headline rule and outcome table (protocol section 5)."""
+"""Sweep run table, data subsets, resumable runs, settings carried forward and outcome table (protocol section 5)."""
 from __future__ import annotations
 
 import json
@@ -10,8 +10,9 @@ import pytest
 import torch
 
 from medinterp.dictionaries.sae import TopKSAE
-from medinterp.sweep import (classify_outcome, headline_k, parse_rows, subset_train_images, sweep_table,
-                             token_rows, train_run)
+from medinterp.sweep import (classify_outcome, p11_supported, parse_rows, seedsplit_base_rows, setting_role,
+                             subset_train_images, summarise_decoder_diagnostic, sweep_table, token_rows,
+                             train_run, training_length_table)
 
 
 def test_table_phase_one_matches_protocol():
@@ -25,16 +26,70 @@ def test_table_phase_one_matches_protocol():
     assert (t[t.phase != "1n"].decoder == "trained").all()
 
 
-def test_table_with_headline_appends_phase_two_without_renumbering():
-    base, full = sweep_table(), sweep_table(headline_k=16)
+def test_phase_two_is_appended_without_renumbering():
+    base, full = sweep_table(), sweep_table(phase2=True)
+    assert len(base) == 58 and len(full) == 115
     assert full.iloc[:len(base)].equals(base)
+    assert full.run_units.sum() == pytest.approx(91.75)
+
+
+def test_phase_two_matches_the_protocol_table():
+    full = sweep_table(phase2=True)
     two = full[full.phase.str.startswith("2")]
-    assert set(two.k) == {16}
-    assert full.run_units.sum() == pytest.approx(74.25)
-    seedsplit = two[two.phase == "2b"]
+    units = two.groupby("phase").run_units.sum()
+    assert units.to_dict() == pytest.approx({"2a": 33.0, "2b": 1.5, "2c": 4.5, "2d": 4.5})
+    all_tests = {(1024, 8), (1024, 16), (1024, 32)}
+    assert set(zip(two[two.phase == "2a"].d_sae, two[two.phase == "2a"].k)) == all_tests | {(4096, 32), (4096, 48)}
+    for phase in ("2b", "2c", "2d"):
+        part = two[two.phase == phase]
+        assert set(zip(part.d_sae, part.k)) == all_tests
+    long_runs = two[two.phase == "2a"]
+    assert (long_runs.steps == 80_000).all() and (long_runs.checkpoints == "20000;40000;80000").all()
+    assert (long_runs.groupby("setting").size() == 3).all()
+    seedsplit = two[(two.phase == "2b") & (two.k == 8)]
     assert sorted(zip(seedsplit.init_seed, seedsplit.data_seed)) == [(0, 1), (1, 0)]
+
+
+def test_seedsplit_reuses_the_phase_one_runs_of_its_setting():
+    full = sweep_table(phase2=True)
+    base = seedsplit_base_rows(full, 1024, 16)
+    assert base.run_id.tolist() == ["d1024_k16_s20000_i0_b0", "d1024_k16_s20000_i1_b1"]
+    assert set(base.phase) == {"1b"}
+
+
+def test_setting_roles():
+    assert [setting_role(1024, k) for k in (8, 16, 32)] == ["core"] * 3
+    assert setting_role(4096, 32) == "core"
+    assert setting_role(4096, 48) == "dense reference"
+    assert {setting_role(4096, k) for k in (4, 8, 16)} == {"appendix"}
+    assert setting_role(1024, 48) == "appendix"
+    assert setting_role(1024, 4) == setting_role(16_384, 16) == "not carried forward"
+
+
+def test_p11_counts_every_setting_up_to_max_k_including_the_appendix():
+    good = pd.DataFrame({"d_sae": [1024, 4096, 4096], "k": [8, 4, 48], "gap": [0.10, 0.14, 0.01],
+                         "separated": [True, True, True]})
+    assert p11_supported(good, margin=0.02, max_k=16)              # k = 48 lies outside the margin rule
+    narrow_appendix = good.assign(gap=[0.10, 0.01, 0.03])
+    assert not p11_supported(narrow_appendix, margin=0.02, max_k=16)
+    overlapping = good.assign(separated=[True, False, True])
+    assert not p11_supported(overlapping, margin=0.02, max_k=16)
     with pytest.raises(ValueError):
-        sweep_table(headline_k=12)
+        p11_supported(good[good.k == 48], margin=0.02, max_k=16)
+
+
+def test_training_length_compares_the_80k_runs_with_the_phase_one_runs():
+    curve = pd.DataFrame([
+        {"setting": "d1024_k8_s20000", "steps": 20_000, "S_mean": 0.35},
+        {"setting": "d1024_k8_s80000", "steps": 20_000, "S_mean": 0.20},
+        {"setting": "d1024_k8_s80000", "steps": 80_000, "S_mean": 0.47},
+        {"setting": "d4096_k48_s20000", "steps": 20_000, "S_mean": 0.09},
+    ])
+    table = training_length_table(curve)
+    assert table.setting.tolist() == ["d1024_k8_s20000"]         # k = 48 has no 80k runs yet
+    assert table.loc[0, "delta"] == pytest.approx(0.12)
+    assert table.loc[0, "S_80k_run_at_20k"] == pytest.approx(0.20)
+    assert table.loc[0, "role"] == "core"
 
 
 def test_parse_rows():
@@ -107,25 +162,26 @@ def test_frozen_decoder_run_keeps_its_decoder(tmp_path):
     assert torch.allclose(sae.W_dec, isotropic_directions(32, 1024, 0), atol=1e-6)
 
 
-def test_headline_rule_uses_worst_seed_against_best_null():
-    fve = pd.DataFrame([
-        *({"k": 4, "dictionary_kind": "trained", "dictionary": f"s{i}", "value": v} for i, v in enumerate([0.70, 0.72])),
-        {"k": 4, "dictionary_kind": "signed_pca", "dictionary": "pca", "value": 0.60},
-        *({"k": 48, "dictionary_kind": "trained", "dictionary": f"s{i}", "value": v} for i, v in enumerate([0.92, 0.95])),
-        {"k": 48, "dictionary_kind": "signed_pca", "dictionary": "pca", "value": 0.88},
-        {"k": 48, "dictionary_kind": "random_sae", "dictionary": "r", "value": 0.01},
-    ])
-    k, gaps = headline_k(fve)
-    assert k == 4
-    assert gaps.set_index("k").loc[48, "gap"] == pytest.approx(0.04)
-    assert gaps.set_index("k").loc[4, "best_null"] == "pca"
+def test_decoder_diagnostic_summary_groups_seeds_and_adds_dead_latents():
+    runs = pd.DataFrame({"run_id": ["a", "b", "c"], "d_sae": [1024, 1024, 4096], "k": [8, 8, 48],
+                         "step": [20_000] * 3, "c_dec": [0.10, 0.20, 0.30]})
+    fve = pd.DataFrame({"setting": ["d1024_k8_s20000", "d1024_k8_s20000", "d1024_k8_s80000"], "d_sae": [1024] * 3,
+                        "k": [8] * 3, "step": [20_000] * 3, "dictionary_kind": ["trained"] * 3, "n_dead": [2, 4, 100]})
+    table = summarise_decoder_diagnostic(runs, fve).set_index("setting")
+    assert table.loc["d1024_k8_s20000", "c_dec_mean"] == pytest.approx(0.15)
+    assert table.loc["d1024_k8_s20000", "n_runs"] == 2 and table.loc["d1024_k8_s20000", "role"] == "core"
+    assert table.loc["d1024_k8_s20000", "mean_dead_on_val"] == pytest.approx(3.0)   # the 80k run is excluded
+    assert table.loc["d4096_k48_s20000", "role"] == "dense reference"
+    assert np.isnan(table.loc["d4096_k48_s20000", "mean_dead_on_val"])
 
 
 def test_outcome_table_order():
     th = {"high": 0.30, "low": 0.15, "under_training": 0.10}
     small = ["d4096_k4", "d1024_k48"]
-    assert classify_outcome({"t": 0.09, "d4096_k4": 0.35}, "t", small, None, th) == "operating point"
-    assert classify_outcome({"t": 0.09, "d4096_k4": 0.10}, "t", small, 0.12, th) == "under-training"
-    assert classify_outcome({"t": 0.09, "d4096_k4": 0.10}, "t", small, 0.01, th) == "robust low"
+    flat, rising = {"a": 0.01, "b": 0.02}, {"a": 0.01, "b": 0.12}
+    assert classify_outcome({"t": 0.09, "d4096_k4": 0.35}, "t", small, rising, th) == "operating point"
+    assert classify_outcome({"t": 0.09, "d4096_k4": 0.10}, "t", small, rising, th) == "under-training"
+    assert classify_outcome({"t": 0.09, "d4096_k4": 0.10}, "t", small, flat, th) == "robust low"
     assert classify_outcome({"t": 0.09, "d4096_k4": 0.10}, "t", small, None, th) == "in between"
-    assert classify_outcome({"t": 0.20, "d4096_k4": 0.10}, "t", small, 0.01, th) == "in between"
+    assert classify_outcome({"t": 0.09, "d4096_k4": 0.10}, "t", small, {}, th) == "in between"
+    assert classify_outcome({"t": 0.20, "d4096_k4": 0.10}, "t", small, flat, th) == "in between"
