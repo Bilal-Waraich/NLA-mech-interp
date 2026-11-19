@@ -106,7 +106,7 @@ def main() -> None:
     log(f"functional null q{NULL_QUANTILE * 100:g} = {null_q:.4f}", handle)
     table.to_csv(args.out / "latents.csv", index=False)
 
-    live = table[[f"best_{s}" for s in SEEDS]].notna().all(1)
+    live = table[[f"best_{s}" for s in SEEDS]].notna().all(axis=1)
     summary = {"null_quantile_value": null_q, "n_live_in_thesis_sae": int(live.sum()),
                "thesis65": summarise_latent_group(table[table.thesis65], SEEDS, THRESHOLD, null_q),
                "all_live": summarise_latent_group(table[live], SEEDS, THRESHOLD, null_q),
