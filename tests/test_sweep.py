@@ -28,9 +28,9 @@ def test_table_phase_one_matches_protocol():
 
 def test_later_phases_are_appended_without_renumbering():
     base, full = sweep_table(), sweep_table(full=True)
-    assert len(base) == 58 and len(full) == 125
+    assert len(base) == 58 and len(full) == 130
     assert full.iloc[:len(base)].equals(base)
-    assert full.run_units.sum() == pytest.approx(94.25)
+    assert full.run_units.sum() == pytest.approx(99.25)
     # Phase 2 was decided before phase 1c, so it keeps rows 58-114 and phase 1c follows.
     assert set(full.iloc[58:115].phase) == {"2a", "2b", "2c", "2d"}
     assert set(full.iloc[115:].phase) == {"1c"}
@@ -38,9 +38,10 @@ def test_later_phases_are_appended_without_renumbering():
 
 def test_k_extension_matches_the_protocol_table():
     ext = sweep_table(full=True).query("phase == '1c'")
-    assert set(zip(ext.d_sae, ext.k)) == {(1024, 64), (1024, 96)}
+    assert set(zip(ext.d_sae, ext.k)) == {(1024, 64), (1024, 96), (4096, 64)}
     assert (ext.groupby("setting").size() == 5).all() and (ext.steps == 20_000).all()
-    assert (ext.init_seed == ext.data_seed).all() and ext.run_units.sum() == pytest.approx(2.5)
+    assert (ext.init_seed == ext.data_seed).all() and ext.run_units.sum() == pytest.approx(7.5)
+    assert ext.row.tolist() == list(range(115, 130))
     assert ext.checkpoints.eq("5000;10000;20000").all()
 
 
@@ -75,7 +76,7 @@ def test_setting_roles():
     assert {setting_role(4096, k) for k in (4, 8, 16)} == {"appendix"}
     assert setting_role(1024, 48) == "appendix"
     assert setting_role(1024, 64) == "dense reference" and setting_role(1024, 96) == "appendix"
-    assert setting_role(4096, 64) == "not carried forward"
+    assert setting_role(4096, 64) == "appendix"
     assert setting_role(1024, 4) == setting_role(16_384, 16) == "not carried forward"
 
 

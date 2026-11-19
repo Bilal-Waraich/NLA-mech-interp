@@ -36,9 +36,11 @@ from .dictionaries.train import BatchTopKTrainer, TrainConfig
 SWEEP_COLUMNS = ["row", "phase", "setting", "run_id", "decoder", "d_sae", "k", "steps", "init_seed",
                  "data_seed", "sampling", "l1_coeff", "data_fraction", "checkpoints", "run_units"]
 PHASE1_KS = (4, 8, 16, 32, 48)
-# Phase 1c: larger k at 1,024 latents, added after the decoder diagnostic had no minimum up to k = 48.
+# Phase 1c: larger k at 1,024 latents, added after the decoder diagnostic had no minimum up to k = 48, and
+# k = 64 at 4,096 latents, added afterwards for a matched size comparison at k = 32, 48 and 64.
 EXTENSION_D_SAE = 1024
 EXTENSION_KS = (64, 96)
+EXTENSION_4096_KS = (64,)
 BASE_D_SAE = 4096
 BASE_STEPS = 20_000
 BASE_L1 = TrainConfig().l1_coeff
@@ -52,7 +54,7 @@ CORE_SETTINGS = ((1024, 8), (1024, 16), (1024, 32), (4096, 32))
 THESIS_SETTING = (4096, 48)
 # (1024, 64) becomes a core setting instead if the label-transfer rule of protocol section 5 says so.
 DENSE_REFERENCES = ((4096, 48), (1024, 64))
-APPENDIX_SETTINGS = ((1024, 48), (1024, 96), (4096, 4), (4096, 8), (4096, 16))
+APPENDIX_SETTINGS = ((1024, 48), (1024, 96), (4096, 4), (4096, 8), (4096, 16), (4096, 64))
 PHASE2_ALL_TESTS = ((1024, 8), (1024, 16), (1024, 32))
 PHASE2_TRAINING_LENGTH_ONLY = ((4096, 32), (4096, 48))
 
@@ -128,6 +130,8 @@ def sweep_table(full: bool = False) -> pd.DataFrame:
             rows += _training_length_rows(d_sae, k)
         for k in EXTENSION_KS:
             rows += [_row("1c", EXTENSION_D_SAE, k, s, s) for s in range(5)]
+        for k in EXTENSION_4096_KS:
+            rows += [_row("1c", BASE_D_SAE, k, s, s) for s in range(5)]
     table = pd.DataFrame(rows)
     table.insert(0, "row", np.arange(len(table)))
     if not table.run_id.is_unique:

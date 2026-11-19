@@ -37,8 +37,8 @@ ROOT = Path(os.environ.get("MEDINTERP_DATA", REPO))
 P11_MARGIN, P11_MAX_K = 0.02, 16
 OUTCOME_THRESHOLDS = {"high": 0.30, "low": 0.15, "under_training": 0.10}
 OUTCOME_SMALL_MAX_K, OUTCOME_SMALL_D_SAE = 16, 1024
-# Settings at 20k steps that the outcome row reads: 11 of phases 1a and 1b, and 2 of phase 1c.
-N_BASE_SETTINGS = 13
+# Settings at 20k steps that the outcome row reads: 11 of phases 1a and 1b, and 3 of phase 1c.
+N_BASE_SETTINGS = 14
 
 
 def main() -> None:
