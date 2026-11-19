@@ -115,6 +115,34 @@ def null_specs(ctx: Context, d_sae: int, k: int, random_seeds: list[int], pca_to
     return specs
 
 
+def summarise_latent_group(table: pd.DataFrame, seeds: list[str], threshold: float, null_quantile: float) -> dict:
+    """Functional recurrence of one group of latents of an anchor SAE in other seeds (protocol section 4,
+    thesis-latent check).
+
+    ``table`` has one row per latent of the group and, per seed s, columns ``one_to_one_<s>`` and ``best_<s>``
+    (code correlations; NaN for a latent that never fires). Returns, per seed and as the mean over seeds: the
+    share whose one-to-one partner reaches ``threshold`` and ``null_quantile``, the share whose best partner
+    reaches ``threshold``, and the median best correlation; plus the shares that recur in every seed.
+    Raises ValueError for an empty group.
+    """
+    if table.empty:
+        raise ValueError("empty group")
+    out = {"n": int(len(table)), "per_seed": {}}
+    for s in seeds:
+        o2o, best = table[f"one_to_one_{s}"].fillna(-np.inf), table[f"best_{s}"].fillna(-np.inf)
+        out["per_seed"][s] = {"one_to_one_ge_threshold": float((o2o >= threshold).mean()),
+                              "one_to_one_ge_null": float((o2o >= null_quantile).mean()),
+                              "best_ge_threshold": float((best >= threshold).mean()),
+                              "median_best": float(table[f"best_{s}"].median())}
+    for key in ("one_to_one_ge_threshold", "one_to_one_ge_null", "best_ge_threshold", "median_best"):
+        out[f"mean_{key}"] = float(np.mean([v[key] for v in out["per_seed"].values()]))
+    o2o_all = np.column_stack([table[f"one_to_one_{s}"].fillna(-np.inf) for s in seeds])
+    best_all = np.column_stack([table[f"best_{s}"].fillna(-np.inf) for s in seeds])
+    out["one_to_one_ge_threshold_in_every_seed"] = float((o2o_all >= threshold).all(1).mean())
+    out["best_ge_threshold_in_every_seed"] = float((best_all >= threshold).all(1).mean())
+    return out
+
+
 def subset(codes: dict[str, np.ndarray], masks: dict[str, dict[str, np.ndarray]], split: str
            ) -> dict[str, np.ndarray]:
     return {d: codes[d][masks[d][split]] for d in codes}

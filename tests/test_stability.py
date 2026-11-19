@@ -203,3 +203,35 @@ def test_firing_rates_count_tokens_and_images():
     token_rate, image_rate = firing_rates(enc, EvalTokens(x, np.array([0, 1]), 2))
     assert token_rate.tolist() == pytest.approx([1.0, 0.5, 0.0])
     assert image_rate.tolist() == pytest.approx([1.0, 0.5, 0.0])
+
+
+def test_functional_partner_scores_find_split_concepts():
+    """A latent copied into two latents of B has no full one-to-one partner left for its twin, but its best
+    (many-to-one) partner is still perfect."""
+    from medinterp.dictionaries.baselines import LinearTopK
+    from medinterp.eval.sweep_metrics import EvalTokens, functional_partner_scores
+
+    gen = torch.Generator().manual_seed(0)
+    W = torch.randn(8, 4, generator=gen)
+    a = LinearTopK(W, 4, "a")
+    b = LinearTopK(torch.cat([W, W[:, :1]], 1), 5, "b")      # latent 0 of A appears twice in B
+    x = torch.randn(400, 8, generator=gen)
+    o2o, best = functional_partner_scores(a, b, EvalTokens(x, np.arange(200), 2))
+    assert np.allclose(best, 1.0, atol=1e-6) and np.allclose(o2o, 1.0, atol=1e-6)
+
+
+def test_summarise_latent_group():
+    import pandas as pd
+    from medinterp.stage0_v1 import summarise_latent_group
+
+    t = pd.DataFrame({"one_to_one_s0": [0.9, 0.5, np.nan], "best_s0": [0.95, 0.8, np.nan],
+                      "one_to_one_s1": [0.8, 0.75, np.nan], "best_s1": [0.9, 0.85, np.nan]})
+    s = summarise_latent_group(t, ["s0", "s1"], threshold=0.7, null_quantile=0.85)
+    assert s["n"] == 3 and s["per_seed"]["s0"]["one_to_one_ge_threshold"] == pytest.approx(1 / 3)
+    assert s["mean_one_to_one_ge_threshold"] == pytest.approx(0.5)
+    assert s["mean_one_to_one_ge_null"] == pytest.approx(1 / 6)
+    assert s["mean_best_ge_threshold"] == pytest.approx(2 / 3)
+    assert s["one_to_one_ge_threshold_in_every_seed"] == pytest.approx(1 / 3)
+    assert s["best_ge_threshold_in_every_seed"] == pytest.approx(2 / 3)
+    with pytest.raises(ValueError):
+        summarise_latent_group(t.iloc[:0], ["s0"], 0.7, 0.85)

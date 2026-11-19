@@ -178,6 +178,29 @@ def functional_overlap(enc_a, enc_b, tokens: EvalTokens, device: str = "cpu",
     return scores, int(acc.dead_a.sum()), int(acc.dead_b.sum())
 
 
+def functional_partner_scores(enc_a, enc_b, tokens: EvalTokens, device: str = "cpu",
+                              images_per_chunk: int = 256) -> tuple[np.ndarray, np.ndarray]:
+    """Per latent of ``enc_a``: its one-to-one code correlation with ``enc_b`` and its best correlation with
+    any latent of ``enc_b`` (many-to-one, so a concept split over several latents still finds a partner).
+
+    Both are NaN for a latent that never fires on the tokens. Memory: O(d_sae_a * d_sae_b) float64.
+    """
+    a, b = _to_device(enc_a, device), _to_device(enc_b, device)
+    acc = None
+    for x in tokens.chunks(images_per_chunk):
+        xd = x.to(device)
+        za, zb = a.encode(xd).cpu(), b.encode(xd).cpu()
+        if acc is None:
+            acc = CodeCorrelation(za.shape[1], zb.shape[1])
+        acc.add(za, zb)
+    corr = acc.correlation()
+    one_to_one_scores, _ = functional_one_to_one(corr)
+    live_rows = ~np.isnan(corr).all(1)
+    best = np.full(corr.shape[0], np.nan)
+    best[live_rows] = np.nanmax(corr[live_rows], axis=1)
+    return one_to_one_scores, best
+
+
 def covariance_topk(cov: torch.Tensor, n_latents: int, k: int, seed: int) -> LinearTopK:
     """Top-k dictionary whose latents are covariance-shaped random directions (encoder = directions)."""
     return LinearTopK(covariance_directions(cov, n_latents, seed).T.contiguous(), k, f"covariance_topk_{seed}")
