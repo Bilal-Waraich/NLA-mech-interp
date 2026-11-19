@@ -7,6 +7,7 @@ harvest), so every dictionary of the sweep is scored on exactly the same tokens.
   score_dictionary    own-decoder FVE with a cluster-bootstrap interval, dead latents, latents active on
                       every image
   decoder_overlap     one-to-one decoder cosine between two dictionaries
+  decoder_pairwise_cosine  mean absolute cosine between the decoder rows of one dictionary
   covariance_null     the data-aware null of decoder matching: an anchor against random directions drawn
                       from the token covariance
   functional_overlap  one-to-one correlation of token-level sparse codes
@@ -108,6 +109,27 @@ def _to_device(enc, device: str):
 def decoder_overlap(dec_a: torch.Tensor, dec_b: torch.Tensor) -> np.ndarray:
     """Per row of ``dec_a``: cosine to its one-to-one partner in ``dec_b`` (NaN without a partner)."""
     return one_to_one(cosine_matrix(dec_a, dec_b))[0]
+
+
+def decoder_pairwise_cosine(decoder: torch.Tensor, rows_per_chunk: int = 1024) -> float:
+    """Mean absolute cosine over all distinct pairs of decoder rows (c_dec of Chanin & Garriga-Alonso 2026, Eq. 4).
+
+    Parameters:
+      decoder         ``[n_latents, d_model]``; rows are the latents' decoder directions
+      rows_per_chunk  rows multiplied at a time, which bounds memory on large dictionaries
+    Raises ValueError for fewer than two latents or a zero row, whose cosine is undefined.
+    Complexity: O(n_latents^2 * d_model) time, O(rows_per_chunk * n_latents) memory.
+    """
+    n_latents = decoder.shape[0]
+    if n_latents < 2:
+        raise ValueError("c_dec needs at least two latents")
+    norms = decoder.norm(dim=1, keepdim=True)
+    if (norms == 0).any():
+        raise ValueError("c_dec is undefined for a zero decoder row")
+    unit = (decoder / norms).double()
+    # Every pair appears twice in the full matrix and the diagonal holds the n_latents self-similarities.
+    total = sum(float((chunk @ unit.T).abs().sum()) for chunk in unit.split(rows_per_chunk))
+    return (total - n_latents) / (n_latents * (n_latents - 1))
 
 
 def covariance_null(dec_anchor: torch.Tensor, cov: torch.Tensor, seeds: tuple[int, ...]) -> np.ndarray:

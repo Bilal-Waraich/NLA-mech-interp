@@ -150,6 +150,30 @@ def test_covariance_null_reproduces_known_quantile() -> None:
     assert abs(q - 0.77) <= 0.02
 
 
+def test_decoder_pairwise_cosine_known_answers():
+    from medinterp.eval.sweep_metrics import decoder_pairwise_cosine
+
+    assert decoder_pairwise_cosine(torch.eye(8)) == pytest.approx(0.0)
+    # Opposite directions count fully because the metric takes the absolute cosine.
+    assert decoder_pairwise_cosine(torch.tensor([[1.0, 0.0], [-3.0, 0.0]])) == pytest.approx(1.0)
+    # Three pairs: (a, b) = 1, and (a, c) = (b, c) = 0.
+    assert decoder_pairwise_cosine(torch.tensor([[1.0, 0.0], [2.0, 0.0], [0.0, 5.0]])) == pytest.approx(1 / 3)
+    with pytest.raises(ValueError):
+        decoder_pairwise_cosine(torch.ones(1, 4))
+    with pytest.raises(ValueError):
+        decoder_pairwise_cosine(torch.tensor([[1.0, 0.0], [0.0, 0.0]]))
+
+
+def test_decoder_pairwise_cosine_matches_brute_force_for_any_chunk_size():
+    from medinterp.eval.sweep_metrics import decoder_pairwise_cosine
+
+    decoder = torch.randn(37, 16, generator=torch.Generator().manual_seed(0))
+    unit = decoder / decoder.norm(dim=1, keepdim=True)
+    pairs = [abs(float(unit[i] @ unit[j])) for i in range(37) for j in range(i + 1, 37)]
+    for rows_per_chunk in (1, 5, 37, 100):
+        assert decoder_pairwise_cosine(decoder, rows_per_chunk) == pytest.approx(np.mean(pairs), abs=1e-6)
+
+
 def test_sweep_metrics_on_toy_tokens():
     """FVE of an exact dictionary is 1; a dictionary matches itself functionally and by decoder."""
     from medinterp.eval.sweep_metrics import EvalTokens, decoder_overlap, functional_overlap, score_dictionary
