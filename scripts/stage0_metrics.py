@@ -35,7 +35,7 @@ import pandas as pd
 import torch
 
 from medinterp.data.archive import DEFAULT_RUN_DIR, ArchivedActivations
-from medinterp.data.manifests import CHEXPERT_LABELS, build_manifests
+from medinterp.data.manifests import CHEXPERT_LABELS, DEFAULT_LABEL_DIR, build_manifests
 from medinterp.dictionaries.baselines import random_sae, signed_basis, signed_pca
 from medinterp.dictionaries.sae import TopKSAE
 from medinterp.eval.probing import fit_eval, sparse_probe_transfer
@@ -244,7 +244,6 @@ def v1_pooled_activations(ctx, pooling: str) -> dict[str, np.ndarray]:
 
 
 def main_v1(args) -> None:
-    from medinterp.data.manifests import DEFAULT_LABEL_DIR
     from medinterp.eval.probing import eval_images, mean_cross_auroc_statistic, sparse_probe_transfer_tuned
     from medinterp.eval.stats import cluster_bootstrap, complete_separation
     from medinterp.runinfo import write_config
@@ -256,7 +255,7 @@ def main_v1(args) -> None:
         return
     out.mkdir(parents=True, exist_ok=True)
     LOG_FILES.append(open(out / "run.log", "a"))
-    ctx = load_context(DEFAULT_RUN_DIR, DEFAULT_LABEL_DIR, args.split_file)
+    ctx = load_context(args.run_dir, args.label_dir, args.split_file)
     names, d_model, ev_split = list(ctx.acts.blocks), ctx.acts.d_model, args.eval_split
     saes = parse_sae_args(args.sae) or {f"seed{s}": ROOT / f"results/stage0/sae_seeds/seed{s}" for s in (0, 1, 2)}
     specs = [trained_spec(n, p, args.sae_fit_split) for n, p in saes.items()]
@@ -383,6 +382,8 @@ def parse_args():
     ap.add_argument("--sae-fit-split", default="all",
                     help="v1: images the given SAEs were fitted on, if their cfg.json does not say")
     ap.add_argument("--force", action="store_true", help="v1: recompute even if summary.json exists")
+    ap.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR, help="v1: archived activations (thesis harvest)")
+    ap.add_argument("--label-dir", type=Path, default=DEFAULT_LABEL_DIR, help="v1: label directory")
     args = ap.parse_args()
     if args.out is None:
         args.out = OUT if args.protocol == "thesis" else ROOT / f"results/stage0_v1/metrics_{args.pooling}"
