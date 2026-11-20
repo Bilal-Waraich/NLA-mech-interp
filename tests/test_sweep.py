@@ -28,12 +28,14 @@ def test_table_phase_one_matches_protocol():
 
 def test_later_phases_are_appended_without_renumbering():
     base, full = sweep_table(), sweep_table(full=True)
-    assert len(base) == 58 and len(full) == 130
+    assert len(base) == 58 and len(full) == 133
     assert full.iloc[:len(base)].equals(base)
-    assert full.run_units.sum() == pytest.approx(99.25)
+    assert full.run_units.sum() == pytest.approx(102.25)
+    tail = full.iloc[130:]
+    assert set(tail.phase) == {"2a"} and set(tail.setting) == {"d1024_k64_s80000"}
     # Phase 2 was decided before phase 1c, so it keeps rows 58-114 and phase 1c follows.
     assert set(full.iloc[58:115].phase) == {"2a", "2b", "2c", "2d"}
-    assert set(full.iloc[115:].phase) == {"1c"}
+    assert set(full.iloc[115:130].phase) == {"1c"}
 
 
 def test_k_extension_matches_the_protocol_table():
@@ -49,9 +51,9 @@ def test_phase_two_matches_the_protocol_table():
     full = sweep_table(full=True)
     two = full[full.phase.str.startswith("2")]
     units = two.groupby("phase").run_units.sum()
-    assert units.to_dict() == pytest.approx({"2a": 33.0, "2b": 1.5, "2c": 4.5, "2d": 4.5})
+    assert units.to_dict() == pytest.approx({"2a": 36.0, "2b": 1.5, "2c": 4.5, "2d": 4.5})
     all_tests = {(1024, 8), (1024, 16), (1024, 32)}
-    assert set(zip(two[two.phase == "2a"].d_sae, two[two.phase == "2a"].k)) == all_tests | {(4096, 32), (4096, 48)}
+    assert set(zip(two[two.phase == "2a"].d_sae, two[two.phase == "2a"].k)) == all_tests | {(4096, 32), (4096, 48), (1024, 64)}
     for phase in ("2b", "2c", "2d"):
         part = two[two.phase == phase]
         assert set(zip(part.d_sae, part.k)) == all_tests

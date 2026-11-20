@@ -72,7 +72,7 @@ def main() -> None:
     training = training_length_table(curve)
     training.to_csv(args.sweep / "training_length.csv", index=False)
     report["training_length"] = training.to_dict("records")
-    training_complete = len(training) == len(PHASE2_ALL_TESTS + PHASE2_TRAINING_LENGTH_ONLY)
+    training_complete = len(training) == len(PHASE2_ALL_TESTS + PHASE2_TRAINING_LENGTH_ONLY) + 1   # + k = 64 at 1,024
 
     # 4. Outcome row. Only the 20k settings of phase 1 (1a, 1b, 1c) enter it: the 80k runs also have a 20k
     # checkpoint, and the phase 2 variants carry a suffix.

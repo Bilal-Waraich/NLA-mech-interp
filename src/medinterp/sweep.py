@@ -132,6 +132,8 @@ def sweep_table(full: bool = False) -> pd.DataFrame:
             rows += [_row("1c", EXTENSION_D_SAE, k, s, s) for s in range(5)]
         for k in EXTENSION_4096_KS:
             rows += [_row("1c", BASE_D_SAE, k, s, s) for s in range(5)]
+        # Decided after phase 1c: k = 64 at 1,024 latents is a dense reference, so it gets phase 2a.
+        rows += _training_length_rows(EXTENSION_D_SAE, EXTENSION_KS[0])
     table = pd.DataFrame(rows)
     table.insert(0, "row", np.arange(len(table)))
     if not table.run_id.is_unique:
@@ -326,7 +328,7 @@ def training_length_table(curve: pd.DataFrame) -> pd.DataFrame:
     """
     S = {(r.setting, int(r.steps)): float(r.S_mean) for r in curve.itertuples()}
     rows = []
-    for d_sae, k in PHASE2_ALL_TESTS + PHASE2_TRAINING_LENGTH_ONLY:
+    for d_sae, k in PHASE2_ALL_TESTS + PHASE2_TRAINING_LENGTH_ONLY + ((EXTENSION_D_SAE, EXTENSION_KS[0]),):
         short, long = setting_name(d_sae, k, BASE_STEPS), setting_name(d_sae, k, LONG_STEPS)
         if (short, BASE_STEPS) not in S or (long, LONG_STEPS) not in S:
             continue
