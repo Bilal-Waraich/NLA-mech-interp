@@ -40,3 +40,14 @@ def test_explained_variance_of_rotated_directions_in_a_shared_plane():
     assert outside[2] == pytest.approx(0.0)
     with pytest.raises(ValueError):
         subspace_explained_variance(basis[:0], rotated, (1,))
+
+
+def test_principal_subspace_explained_variance():
+    from medinterp.eval.subspace import principal_subspace_explained_variance
+
+    cov = torch.diag(torch.tensor([10.0, 5.0, 1.0]))
+    target = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    ev = principal_subspace_explained_variance(cov, target, ranks=(1, 2, 3))
+    assert ev[1] == pytest.approx(0.5) and ev[2] == pytest.approx(0.5) and ev[3] == pytest.approx(1.0)
+    with pytest.raises(ValueError):
+        principal_subspace_explained_variance(cov, target[:0], (1,))

@@ -48,8 +48,8 @@ from medinterp.dictionaries.baselines import covariance_directions, random_sae, 
 from medinterp.dictionaries.sae import TopKSAE
 from medinterp.eval.stability import TokenMoments, cosine_matrix, one_to_one
 from medinterp.eval.stats import complete_separation
-from medinterp.eval.subspace import (effective_rank, reappearance_probability, stability_sets,
-                                     subspace_explained_variance)
+from medinterp.eval.subspace import (effective_rank, principal_subspace_explained_variance,
+                                     reappearance_probability, stability_sets, subspace_explained_variance)
 from medinterp.eval.sweep_metrics import (covariance_null, decoder_overlap, firing_rates, functional_null,
                                           functional_overlap, load_eval_tokens, score_dictionary)
 from medinterp.runinfo import write_config
@@ -339,6 +339,13 @@ def run_subspace(settings: dict, tokens, cov, device: str, out: Path, force: boo
                     null = covariance_directions(cov, len(sets[s][0]), seed=SEED)
                     ev = subspace_explained_variance(decs[a][sets[a][0]], null.float(), SUBSPACE_RANKS)
                     row.update({f"null_r{r}": v for r, v in ev.items()})
+                    # Basis nulls: the same target, explained by a random data-shaped subspace of the anchor
+                    # set's size and by the data's principal subspace.
+                    random_basis = covariance_directions(cov, len(sets[a][0]), seed=SEED + 1).float()
+                    ev = subspace_explained_variance(random_basis, decs[s][sets[s][0]], SUBSPACE_RANKS)
+                    row.update({f"basis_random_r{r}": v for r, v in ev.items()})
+                    ev = principal_subspace_explained_variance(cov, decs[s][sets[s][0]], SUBSPACE_RANKS)
+                    row.update({f"basis_pca_r{r}": v for r, v in ev.items()})
                 pairs.append(row)
         pair_table = pd.DataFrame(pairs)
         pair_table.to_csv(out / f"{name}_pairs.csv", index=False)
@@ -349,7 +356,8 @@ def run_subspace(settings: dict, tokens, cov, device: str, out: Path, force: boo
         target.write_text(json.dumps(summary, indent=1, default=float))
         ev = summary["mean_explained_variance"]
         log(f"subspace {name}: unstable {np.mean([p['n_unstable'] for p in per_seed]):.0f} latents, "
-            + ", ".join(f"r{r}: {ev.get(f'unstable_r{r}', float('nan')):.3f} vs null {ev.get(f'null_r{r}', float('nan')):.3f}"
+            + ", ".join(f"r{r}: {ev.get(f'unstable_r{r}', float('nan')):.3f} vs random basis "
+                        f"{ev.get(f'basis_random_r{r}', float('nan')):.3f}, PCA {ev.get(f'basis_pca_r{r}', float('nan')):.3f}"
                         for r in SUBSPACE_RANKS))
 
 

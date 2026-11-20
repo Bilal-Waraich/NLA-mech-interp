@@ -79,3 +79,21 @@ def subspace_explained_variance(basis_rows: torch.Tensor, target_rows: torch.Ten
             continue
         out[r] = float(((target @ vh[:r].T) ** 2).sum()) / total
     return out
+
+
+def principal_subspace_explained_variance(cov: torch.Tensor, target_rows: torch.Tensor, ranks: tuple[int, ...]
+                                          ) -> dict[int, float]:
+    """For each r in ``ranks``: the share of the squared norm of the unit-normalised ``target_rows`` inside the
+    span of the top r eigenvectors of ``cov`` (the data's principal subspace; a basis null).
+
+    Raises ValueError for an empty target or a non-square ``cov``.
+    """
+    if target_rows.shape[0] == 0:
+        raise ValueError("empty target")
+    if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+        raise ValueError("cov must be square")
+    _, vecs = torch.linalg.eigh(cov.double())
+    top = vecs.flip(1).T                                  # rows ordered by decreasing variance
+    target = _unit_rows(target_rows.double())
+    total = float((target ** 2).sum())
+    return {r: float(((target @ top[:r].T) ** 2).sum()) / total for r in ranks if r <= top.shape[0]}
