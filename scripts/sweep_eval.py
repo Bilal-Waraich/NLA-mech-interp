@@ -48,7 +48,9 @@ from medinterp.dictionaries.baselines import covariance_directions, random_sae, 
 from medinterp.dictionaries.sae import TopKSAE
 from medinterp.eval.stability import TokenMoments, cosine_matrix, one_to_one
 from medinterp.eval.stats import complete_separation
-from medinterp.eval.subspace import (effective_rank, principal_subspace_explained_variance,
+from medinterp.eval.subspace import (effective_rank, explained_variance_in, matched_subset, overlap_of,
+                                     project_out, right_singular_basis, whitening_map,
+                                     principal_subspace_explained_variance,
                                      reappearance_probability, stability_sets, subspace_explained_variance)
 from medinterp.eval.sweep_metrics import (covariance_null, decoder_overlap, firing_rates, functional_null,
                                           functional_overlap, load_eval_tokens, score_dictionary)
@@ -72,6 +74,11 @@ PHASE0 = "phase0_alldata_d4096_k48"
 # Protocol section 5, subspace reproducibility: endpoint cutoff and the ranks of the compared subspaces.
 SUBSPACE_EPSILON = 0.05
 SUBSPACE_RANKS = (8, 16, 32, 64, 128)
+SUBSET_NULL_DRAWS = 20          # latent-subset null of the subspace robustness checks (protocol section 5)
+SUBSET_NULL_QUANTILE = 0.95
+WHITENING_VARIANCE_SHARE = 0.99
+ROBUST_PHASES = ("1a", "1b", "1c")
+ROBUST_SEEDS = 5
 
 
 def log(msg: str) -> None:
@@ -391,6 +398,102 @@ def p11_table(fve: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _coordinate_variants(cov: torch.Tensor) -> dict[str, dict]:
+    """The three coordinate systems of the subspace robustness checks (protocol section 5): per variant a map
+    applied to decoder rows, the covariance of its random basis null, and the covariance whose top
+    eigenvectors give its principal-component basis null."""
+    lam, vecs = torch.linalg.eigh(cov.double())
+    pc1 = vecs[:, -1:].T                                  # top eigenvector as a row
+    off = torch.eye(cov.shape[0], dtype=torch.float64) - pc1.T @ pc1
+    deflated = off @ cov.double() @ off
+    white, projector = whitening_map(cov, WHITENING_VARIANCE_SHARE)
+    unit = lambda x: x / x.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    return {
+        "raw": {"map": lambda rows: unit(rows.double()), "null_cov": cov.double(), "pca_cov": cov.double()},
+        "nopc1": {"map": lambda rows: project_out(rows, pc1), "null_cov": deflated, "pca_cov": deflated},
+        # in whitened coordinates the eigenvectors of cov keep their directions, so they still give the PCA null
+        "white": {"map": lambda rows: unit(rows.double() @ white), "null_cov": projector, "pca_cov": cov.double()},
+    }
+
+
+def run_subspace_robust(settings: dict, tokens, cov, device: str, out: Path, force: bool) -> None:
+    """Robustness checks of subspace reproducibility (protocol section 5, stated 2026-11-24): the latent-subset
+    null matched on firing rate, the coordinate variants without the first principal component and whitened,
+    and the symmetric principal-angle overlap, at each phase 1 / 1c setting with five seeds."""
+    out.mkdir(parents=True, exist_ok=True)
+    variants = _coordinate_variants(cov)
+    for name, info in settings.items():
+        if (info["meta"]["kind"] != "trained" or info["meta"]["phase"] not in ROBUST_PHASES
+                or len(info["runs"]) != ROBUST_SEEDS):
+            continue
+        target = out / f"{name}.json"
+        if target.exists() and not force:
+            continue
+        runs = info["runs"]
+        step = max(set.intersection(*(set(r["steps"]) for r in runs.values())))
+        order = sorted(runs, key=lambda r: (runs[r]["init_seed"], runs[r]["data_seed"]))
+        saes = {r: TopKSAE.from_checkpoint(runs[r]["steps"][step]) for r in order}
+        rates = {r: firing_rates(saes[r], tokens, device)[1] for r in order}
+        decs = {r: saes[r].W_dec.float() for r in order}
+        unstable = {}
+        for r in order:
+            p = reappearance_probability(decs[r], [decs[o] for o in order if o != r], S_THRESHOLD)
+            unstable[r] = stability_sets(p, SUBSPACE_EPSILON, rates[r] > 0)[0]
+        rng = np.random.default_rng(SEED)
+        rows = []
+        for a in order:
+            live_a = np.flatnonzero(rates[a] > 0)
+            if not len(unstable[a]):
+                continue
+            # the same draws serve every target seed and every coordinate variant of this anchor
+            draws = [matched_subset(live_a, rates[a][live_a], rates[a][unstable[a]], rng)
+                     for _ in range(SUBSET_NULL_DRAWS)]
+            for vname, v in variants.items():
+                basis_obs = right_singular_basis(v["map"](decs[a][unstable[a]]))
+                basis_draws = [right_singular_basis(v["map"](decs[a][d])) for d in draws]
+                basis_rand = right_singular_basis(covariance_directions(v["null_cov"], len(unstable[a]), seed=SEED + 1))
+                pca = torch.linalg.eigh(v["pca_cov"])[1].flip(1).T
+                for s in order:
+                    if s == a or not len(unstable[s]):
+                        continue
+                    tgt = v["map"](decs[s][unstable[s]])
+                    basis_tgt = right_singular_basis(tgt)
+                    row = {"anchor": a, "other": s, "variant": vname}
+                    ev = explained_variance_in(basis_obs, tgt, SUBSPACE_RANKS)
+                    ov = overlap_of(basis_obs, basis_tgt, SUBSPACE_RANKS)
+                    ev_draws = [explained_variance_in(b, tgt, SUBSPACE_RANKS) for b in basis_draws]
+                    ov_draws = [overlap_of(b, basis_tgt, SUBSPACE_RANKS) for b in basis_draws]
+                    ev_rand = explained_variance_in(basis_rand, tgt, SUBSPACE_RANKS)
+                    ev_pca = explained_variance_in(pca, tgt, SUBSPACE_RANKS)
+                    ov_rand = overlap_of(basis_rand, basis_tgt, SUBSPACE_RANKS)
+                    ov_pca = overlap_of(pca, basis_tgt, SUBSPACE_RANKS)
+                    for r in ev:
+                        dr = np.array([d[r] for d in ev_draws])
+                        orr = np.array([d[r] for d in ov_draws if r in d])
+                        row.update({f"ev_unstable_r{r}": ev[r], f"ev_subset_mean_r{r}": dr.mean(),
+                                    f"ev_subset_q_r{r}": np.quantile(dr, SUBSET_NULL_QUANTILE),
+                                    f"ev_share_draws_exceeded_r{r}": float((ev[r] > dr).mean()),
+                                    f"ev_basis_random_r{r}": ev_rand.get(r), f"ev_basis_pca_r{r}": ev_pca.get(r)})
+                        if r in ov:
+                            row.update({f"ov_unstable_r{r}": ov[r], f"ov_basis_random_r{r}": ov_rand.get(r),
+                                        f"ov_basis_pca_r{r}": ov_pca.get(r),
+                                        f"ov_subset_q_r{r}": np.quantile(orr, SUBSET_NULL_QUANTILE) if len(orr) else None})
+                    rows.append(row)
+        table = pd.DataFrame(rows)
+        table.to_csv(out / f"{name}_pairs.csv", index=False)
+        means = {vname: {c: float(g[c].mean()) for c in g.columns if c not in ("anchor", "other", "variant")}
+                 for vname, g in table.groupby("variant")}
+        summary = {"setting": name, "d_sae": info["meta"]["d_sae"], "k": info["meta"]["k"], "step": step,
+                   "n_draws": SUBSET_NULL_DRAWS, "quantile": SUBSET_NULL_QUANTILE,
+                   "whitening_variance_share": WHITENING_VARIANCE_SHARE,
+                   "n_unstable": {r: len(unstable[r]) for r in order}, "mean_over_pairs": means}
+        target.write_text(json.dumps(summary, indent=1, default=float))
+        m = means.get("raw", {})
+        log(f"subspace robust {name}: " + ", ".join(
+            f"r{r}: unstable {m.get(f'ev_unstable_r{r}', float('nan')):.3f} vs subset q "
+            f"{m.get(f'ev_subset_q_r{r}', float('nan')):.3f}" for r in SUBSPACE_RANKS))
+
+
 def main() -> None:
     global LOG_FILE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -416,6 +519,8 @@ def main() -> None:
                     help="also run the per-latent check (protocol section 5) on the finished settings")
     ap.add_argument("--subspace", action="store_true",
                     help="also run the subspace-reproducibility check (protocol section 5) on the finished settings")
+    ap.add_argument("--subspace-robust", action="store_true",
+                    help="also run the subspace robustness checks of protocol section 5 (2026-11-24)")
     ap.add_argument("--skip-sweep-metrics", action="store_true",
                     help="skip the per-setting sweep metrics and their aggregation (with --per-latent or --probes)")
     ap.add_argument("--force", action="store_true")
@@ -485,6 +590,9 @@ def main() -> None:
         if args.subspace:
             tok, cv = need_tokens()
             run_subspace(settings, tok, cv, device, args.out / "subspace", args.force)
+        if args.subspace_robust:
+            tok, cv = need_tokens()
+            run_subspace_robust(settings, tok, cv, device, args.out / "subspace_robust", args.force)
         if args.probes is not None:
             run_probes(settings, args.probes or list(settings), args)
         log(f"wrote {args.out}")
