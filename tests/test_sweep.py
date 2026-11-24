@@ -249,3 +249,31 @@ def test_label_transfer_table_and_extension_rule():
     assert extension_k_role(label_transfer_table(weaker)) == "dense reference"   # m = 5 not above k = 16
     with pytest.raises(ValueError):
         extension_k_role(table[table.k != 64])
+
+
+def test_collect_settings_finds_seedsplit_runs_across_run_roots(tmp_path):
+    """Phase 2b's 2 x 2 design takes two runs from phase 1 and two from phase 2, which live in different
+    Kaggle outputs; the setting must be complete only when every run is found in one of the roots."""
+    import importlib.util
+    from pathlib import Path
+    script = Path(__file__).resolve().parents[1] / "scripts/sweep_eval.py"
+    spec = importlib.util.spec_from_file_location("sweep_eval", script)
+    sweep_eval = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sweep_eval)
+
+    full = sweep_table(full=True)
+    seedsplit = full[full.setting == "d1024_k8_s20000_seedsplit"]
+    base = seedsplit_base_rows(full, 1024, 8)
+    phase1_root, phase2_root = tmp_path / "phase1", tmp_path / "phase2"
+    for root, rows in ((phase1_root, base), (phase2_root, seedsplit)):
+        for run_id in rows.run_id:
+            (root / run_id).mkdir(parents=True)
+            (root / run_id / "DONE.json").write_text("{}")
+
+    only_phase2 = sweep_eval.collect_settings(full, [phase2_root], None)
+    assert "d1024_k8_s20000_seedsplit" not in only_phase2
+    both = sweep_eval.collect_settings(full, [phase1_root, phase2_root], None)
+    runs = both["d1024_k8_s20000_seedsplit"]["runs"]
+    assert set(runs) == set(base.run_id) | set(seedsplit.run_id)
+    for run_id in base.run_id:
+        assert runs[run_id]["steps"][20_000] == phase1_root / run_id / "step_20000"

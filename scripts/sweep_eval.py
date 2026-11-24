@@ -85,9 +85,18 @@ def log(msg: str) -> None:
 LOG_FILE = None
 
 
-def collect_settings(table: pd.DataFrame, runs_root: Path, phase0_dir: Path | None) -> dict[str, dict]:
+def find_run(run_id: str, runs_roots: list[Path]) -> Path | None:
+    """The first root that holds a finished ``run_id``, or None."""
+    return next((root / run_id for root in runs_roots if (root / run_id / "DONE.json").exists()), None)
+
+
+def collect_settings(table: pd.DataFrame, runs_roots: list[Path], phase0_dir: Path | None) -> dict[str, dict]:
     """``{setting: {"meta": ..., "runs": {run_id: {"init_seed", "data_seed", "steps": {step: path}}}}}``
-    for settings whose runs are all finished. Frozen-decoder settings are returned with kind "null"."""
+    for settings whose runs are all finished. Frozen-decoder settings are returned with kind "null".
+
+    Several run roots are accepted because a setting's runs can come from different training outputs:
+    phase 2b reuses two phase 1 runs, which sit in another Kaggle run's output than the phase 2 runs.
+    """
     out = {}
     for setting, part in table.groupby("setting", sort=False):
         first = part.iloc[0]
@@ -96,11 +105,12 @@ def collect_settings(table: pd.DataFrame, runs_root: Path, phase0_dir: Path | No
         if first.phase == "2b":
             # The 2 x 2 design reuses the phase 1 runs (0, 0) and (1, 1) of the same setting.
             rows = list(seedsplit_base_rows(table, int(first.d_sae), int(first.k)).itertuples()) + rows
-        if not all((runs_root / r.run_id / "DONE.json").exists() for r in rows):
+        found = {r.run_id: find_run(r.run_id, runs_roots) for r in rows}
+        if any(d is None for d in found.values()):
             continue
         for r in rows:
             runs[r.run_id] = {"init_seed": int(r.init_seed), "data_seed": int(r.data_seed),
-                              "steps": {s: runs_root / r.run_id / f"step_{s}" for s in checkpoint_steps(r._asdict())}}
+                              "steps": {s: found[r.run_id] / f"step_{s}" for s in checkpoint_steps(r._asdict())}}
         out[setting] = {"meta": {"phase": first.phase, "d_sae": int(first.d_sae), "k": int(first.k),
                                  "kind": "null" if first.decoder != "trained" else "trained",
                                  "decoder": first.decoder},
@@ -385,7 +395,8 @@ def main() -> None:
     global LOG_FILE
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", type=Path, default=REPO / "configs/sweep_v1.csv")
-    ap.add_argument("--runs", type=Path, default=ROOT / "results/sweep_v1/runs")
+    ap.add_argument("--runs", type=Path, nargs="+", default=[ROOT / "results/sweep_v1/runs"],
+                    help="one or more run roots; a run is taken from the first root that holds it finished")
     ap.add_argument("--out", type=Path, default=ROOT / "results/sweep_v1/eval")
     ap.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     ap.add_argument("--label-dir", type=Path, default=DEFAULT_LABEL_DIR)
