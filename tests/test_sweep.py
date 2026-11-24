@@ -28,10 +28,11 @@ def test_table_phase_one_matches_protocol():
 
 def test_later_phases_are_appended_without_renumbering():
     base, full = sweep_table(), sweep_table(full=True)
-    assert len(base) == 58 and len(full) == 133
+    assert len(base) == 58 and len(full) == 172
+    assert set(full.iloc[133:139].phase) == {"2e"} and set(full.iloc[133:139].steps) == {160_000}
     assert full.iloc[:len(base)].equals(base)
-    assert full.run_units.sum() == pytest.approx(102.25)
-    tail = full.iloc[130:]
+    assert full.run_units.sum() == pytest.approx(165.25)
+    tail = full.iloc[130:133]
     assert set(tail.phase) == {"2a"} and set(tail.setting) == {"d1024_k64_s80000"}
     # Phase 2 was decided before phase 1c, so it keeps rows 58-114 and phase 1c follows.
     assert set(full.iloc[58:115].phase) == {"2a", "2b", "2c", "2d"}
@@ -51,7 +52,7 @@ def test_phase_two_matches_the_protocol_table():
     full = sweep_table(full=True)
     two = full[full.phase.str.startswith("2")]
     units = two.groupby("phase").run_units.sum()
-    assert units.to_dict() == pytest.approx({"2a": 36.0, "2b": 1.5, "2c": 4.5, "2d": 4.5})
+    assert units.to_dict() == pytest.approx({"2a": 36.0, "2b": 1.5, "2c": 4.5, "2d": 4.5, "2e": 12.0, "2f": 33.0, "2g": 18.0})
     all_tests = {(1024, 8), (1024, 16), (1024, 32)}
     assert set(zip(two[two.phase == "2a"].d_sae, two[two.phase == "2a"].k)) == all_tests | {(4096, 32), (4096, 48), (1024, 64)}
     for phase in ("2b", "2c", "2d"):
@@ -277,3 +278,27 @@ def test_collect_settings_finds_seedsplit_runs_across_run_roots(tmp_path):
     assert set(runs) == set(base.run_id) | set(seedsplit.run_id)
     for run_id in base.run_id:
         assert runs[run_id]["steps"][20_000] == phase1_root / run_id / "step_20000"
+
+
+def test_phase_2f_and_2g_rows():
+    full = sweep_table(full=True)
+    f = full[full.phase == "2f"]
+    assert len(f) == 15 and set(f.projection) == {"nopc1"} and set(f.steps) == {80_000}
+    assert set(zip(f.d_sae, f.k)) == {(1024, 8), (1024, 16), (1024, 32), (4096, 32), (4096, 48)}
+    g = full[full.phase == "2g"]
+    assert len(g) == 18 and set(g.data_fraction) == {0.25, 0.5} and set(g.projection) == {"none"}
+    assert set(full[~full.phase.isin(("2f",))].projection) == {"none"}
+    assert list(full.iloc[139:].phase.unique()) == ["2f", "2g"]
+
+
+def test_remove_component_matches_dense_projection():
+    from medinterp.sweep import remove_component, top_component
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(500, 6)) * np.array([5.0, 1, 1, 1, 1, 1])
+    cov = torch.from_numpy(np.cov(x, rowvar=False))
+    u = top_component(cov)
+    assert abs(abs(u[0]) - 1) < 0.05            # the planted high-variance axis
+    out = remove_component(x.astype(np.float32).copy(), u, rows_per_chunk=64)
+    assert np.allclose(out @ u, 0, atol=1e-4)
+    t = remove_component(torch.from_numpy(x.astype(np.float32)), u, rows_per_chunk=64)
+    assert np.allclose(t.numpy(), out, atol=1e-5)

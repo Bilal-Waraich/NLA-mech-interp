@@ -53,10 +53,10 @@ from medinterp.eval.subspace import (effective_rank, explained_variance_in, matc
                                      principal_subspace_explained_variance,
                                      reappearance_probability, stability_sets, subspace_explained_variance)
 from medinterp.eval.sweep_metrics import (covariance_null, decoder_overlap, firing_rates, functional_null,
-                                          functional_overlap, load_eval_tokens, score_dictionary)
+                                          functional_overlap, load_eval_tokens, score_dictionary, EvalTokens)
 from medinterp.runinfo import write_config
 from medinterp.stage0_v1 import TIDY_COLUMNS, load_context, train_token_sample
-from medinterp.sweep import (checkpoint_steps, overlap_share, per_latent_pair_table, seedsplit_base_rows,
+from medinterp.sweep import (remove_component, top_component, train_token_covariance, checkpoint_steps, overlap_share, per_latent_pair_table, seedsplit_base_rows,
                              summarise_pairs, summarise_per_latent)
 
 REPO = Path(__file__).resolve().parents[1]
@@ -120,7 +120,8 @@ def collect_settings(table: pd.DataFrame, runs_roots: list[Path], phase0_dir: Pa
                               "steps": {s: found[r.run_id] / f"step_{s}" for s in checkpoint_steps(r._asdict())}}
         out[setting] = {"meta": {"phase": first.phase, "d_sae": int(first.d_sae), "k": int(first.k),
                                  "kind": "null" if first.decoder != "trained" else "trained",
-                                 "decoder": first.decoder},
+                                 "decoder": first.decoder,
+                                 "projection": str(getattr(first, "projection", "none") or "none")},
                         "runs": runs}
     if phase0_dir is not None:
         seeds = phase0_dir
@@ -135,14 +136,7 @@ def collect_settings(table: pd.DataFrame, runs_roots: list[Path], phase0_dir: Pa
 def train_covariance(ctx, cache: Path) -> torch.Tensor:
     if cache.exists():
         return torch.load(cache)
-    moments = TokenMoments(ctx.acts.d_model)
-    for name in ctx.acts.blocks:
-        train = ctx.masks[name]["train"]
-        for img0, x in ctx.acts.iter_token_chunks(name, 1024):
-            n_img = x.shape[0] // ctx.acts.n_patches
-            keep = np.repeat(train[img0:img0 + n_img], ctx.acts.n_patches)
-            moments.add(x[torch.from_numpy(keep)])
-    cov = moments.covariance()
+    cov = train_token_covariance(ctx.acts, ctx.masks)
     cache.parent.mkdir(parents=True, exist_ok=True)
     torch.save(cov, cache)
     return cov
@@ -560,20 +554,34 @@ def main() -> None:
     if args.aggregate_only:
         settings = {}
     to_evaluate = {} if args.skip_sweep_metrics else settings
+    projected = None    # (tokens, covariance) without the first principal component, for phase 2f settings
+
+    def inputs_for(info):
+        nonlocal projected
+        tok, cv = need_tokens()
+        if info["meta"].get("projection", "none") != "nopc1":
+            return tok, cv
+        if projected is None:
+            u = top_component(cv)
+            x = remove_component(tok.x.clone(), u)
+            off = torch.eye(cv.shape[0], dtype=torch.float64) - torch.outer(torch.from_numpy(u), torch.from_numpy(u))
+            projected = (EvalTokens(x=x, groups=tok.groups, n_patches=tok.n_patches), off @ cv.double() @ off)
+        return projected
+
     for name, info in to_evaluate.items():
         steps = sorted(set.intersection(*(set(r["steps"]) for r in info["runs"].values())))
         for step in steps:
             f = cache / name / f"step_{step}.json"
             if f.exists() and not args.force:
                 continue
-            tok, cv = need_tokens()
+            tok, cv = inputs_for(info)
             res = evaluate_setting(name, info, step, tok, cv, device, args.functional_max_dsae)
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(json.dumps(res, indent=1, default=float))
 
     pca_sample = None
     for d_sae, k in sorted({(v["meta"]["d_sae"], v["meta"]["k"]) for v in to_evaluate.values()
-                            if v["meta"]["kind"] == "trained"}):
+                            if v["meta"]["kind"] == "trained" and v["meta"].get("projection", "none") == "none"}):
         f = cache / "nulls" / f"d{d_sae}_k{k}.json"
         if f.exists() and not args.force:
             continue

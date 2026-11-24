@@ -34,7 +34,9 @@ from .dictionaries.sae import TopKSAE
 from .dictionaries.train import BatchTopKTrainer, TrainConfig
 
 SWEEP_COLUMNS = ["row", "phase", "setting", "run_id", "decoder", "d_sae", "k", "steps", "init_seed",
-                 "data_seed", "sampling", "l1_coeff", "data_fraction", "checkpoints", "run_units"]
+                 "data_seed", "sampling", "l1_coeff", "data_fraction", "checkpoints", "run_units", "projection"]
+# "projection" says which input the run sees: "none" (the tokens as harvested) or "nopc1" (the top eigenvector
+# of the train-token covariance projected out; phase 2f).
 PHASE1_KS = (4, 8, 16, 32, 48)
 # Phase 1c: larger k at 1,024 latents, added after the decoder diagnostic had no minimum up to k = 48, and
 # k = 64 at 4,096 latents, added afterwards for a matched size comparison at k = 32, 48 and 64.
@@ -47,6 +49,14 @@ BASE_L1 = TrainConfig().l1_coeff
 BASE_CHECKPOINTS = (5_000, 10_000, 20_000)
 LONG_STEPS = 80_000
 LONG_CHECKPOINTS = (20_000, 40_000, 80_000)
+# Phase 2e (protocol section 5, 2026-11-24): is 80k steps converged? Twice as long at the two sparsest core settings.
+LONGER_STEPS = 160_000
+LONGER_CHECKPOINTS = (20_000, 40_000, 80_000, 160_000)
+CONVERGENCE_SETTINGS = ((1024, 8), (1024, 16))
+# Phase 2f (protocol section 5): SAEs trained without the first principal component, matched to phase 2a.
+NOPC1_SETTINGS = ((1024, 8), (1024, 16), (1024, 32), (4096, 32), (4096, 48))
+# Phase 2g (protocol section 5): the data-amount test of phase 2c repeated at the phase 2a length.
+DATA_AT_LENGTH_SETTINGS = ((1024, 8), (1024, 16), (1024, 32))
 
 # Settings carried forward, as (d_sae, k); roles and rules are in protocol section 5.
 CORE_SETTINGS = ((1024, 8), (1024, 16), (1024, 32), (4096, 32))
@@ -82,13 +92,14 @@ def setting_name(d_sae: int, k: int, steps: int, variant: str = "") -> str:
 def _row(phase: str, d_sae: int, k: int, init_seed: int, data_seed: int, *, steps: int = BASE_STEPS,
          sampling: str = "equal", l1_coeff: float = BASE_L1, data_fraction: float = 1.0,
          decoder: str = "trained", checkpoints: tuple[int, ...] = BASE_CHECKPOINTS, variant: str = "",
-         setting: str | None = None) -> dict:
+         setting: str | None = None, projection: str = "none") -> dict:
     setting = setting or setting_name(d_sae, k, steps, variant)
     run_id = f"{setting_name(d_sae, k, steps, variant)}_i{init_seed}_b{data_seed}"
     return {"phase": phase, "setting": setting, "run_id": run_id, "decoder": decoder, "d_sae": d_sae, "k": k,
             "steps": steps, "init_seed": init_seed, "data_seed": data_seed, "sampling": sampling,
             "l1_coeff": l1_coeff, "data_fraction": data_fraction,
-            "checkpoints": ";".join(str(c) for c in checkpoints), "run_units": run_units(d_sae, steps)}
+            "checkpoints": ";".join(str(c) for c in checkpoints), "run_units": run_units(d_sae, steps),
+            "projection": projection}
 
 
 def _training_length_rows(d_sae: int, k: int) -> list[dict]:
@@ -134,6 +145,17 @@ def sweep_table(full: bool = False) -> pd.DataFrame:
             rows += [_row("1c", BASE_D_SAE, k, s, s) for s in range(5)]
         # Decided after phase 1c: k = 64 at 1,024 latents is a dense reference, so it gets phase 2a.
         rows += _training_length_rows(EXTENSION_D_SAE, EXTENSION_KS[0])
+        # Decided after phase 2a showed under-training: does S still rise between 80k and 160k steps?
+        for d_sae, k in CONVERGENCE_SETTINGS:
+            rows += [_row("2e", d_sae, k, s, s, steps=LONGER_STEPS, checkpoints=LONGER_CHECKPOINTS) for s in range(3)]
+        # Decided the same day: the first-principal-component test and the data-amount test at the 2a length.
+        for d_sae, k in NOPC1_SETTINGS:
+            rows += [_row("2f", d_sae, k, s, s, steps=LONG_STEPS, checkpoints=LONG_CHECKPOINTS, variant="nopc1",
+                          projection="nopc1") for s in range(3)]
+        for d_sae, k in DATA_AT_LENGTH_SETTINGS:
+            for frac, tag in ((0.25, "frac25"), (0.5, "frac50")):
+                rows += [_row("2g", d_sae, k, s, s, steps=LONG_STEPS, checkpoints=LONG_CHECKPOINTS,
+                              data_fraction=frac, variant=tag) for s in range(3)]
     table = pd.DataFrame(rows)
     table.insert(0, "row", np.arange(len(table)))
     if not table.run_id.is_unique:
@@ -488,3 +510,49 @@ def load_tokens_fp16(acts) -> dict[str, np.ndarray]:
             pos += len(x)
         data[name] = arr
     return data
+
+
+# ---------------------------------------------------------------- first principal component (phase 2f)
+
+
+def train_token_covariance(acts, masks: Mapping[str, Mapping[str, np.ndarray]]) -> torch.Tensor:
+    """Covariance of the train tokens of every dataset (tokens as ``acts.iter_token_chunks`` yields them).
+
+    Training and evaluation both call this, so the component that phase 2f removes is the same in both.
+    Complexity: one pass over the tokens, O(N_train * d_model^2).
+    """
+    from .eval.stability import TokenMoments
+    moments = TokenMoments(acts.d_model)
+    for name in acts.blocks:
+        train = masks[name]["train"]
+        for img0, x in acts.iter_token_chunks(name, 1024):
+            n_img = x.shape[0] // acts.n_patches
+            keep = np.repeat(train[img0:img0 + n_img], acts.n_patches)
+            moments.add(x[torch.from_numpy(keep)])
+    return moments.covariance()
+
+
+def top_component(cov: torch.Tensor) -> np.ndarray:
+    """Unit eigenvector of ``cov`` with the largest eigenvalue (its sign is arbitrary and does not matter for
+    a projection). Raises ValueError for a non-square ``cov``."""
+    if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
+        raise ValueError("cov must be square")
+    return torch.linalg.eigh(cov.double())[1][:, -1].numpy()
+
+
+def remove_component(x: np.ndarray | torch.Tensor, u: np.ndarray, rows_per_chunk: int = 1 << 16):
+    """``x - (x u) u^T`` for unit ``u``, in place and chunked (``x`` may be a large float16 array); returns ``x``.
+
+    Complexity: O(n_rows * d_model).
+    """
+    if isinstance(x, torch.Tensor):
+        uu = torch.as_tensor(u, dtype=torch.float32)
+        for lo in range(0, x.shape[0], rows_per_chunk):
+            c = x[lo:lo + rows_per_chunk].float()
+            x[lo:lo + rows_per_chunk] = (c - (c @ uu)[:, None] * uu).to(x.dtype)
+        return x
+    uu = u.astype(np.float32)
+    for lo in range(0, x.shape[0], rows_per_chunk):
+        c = x[lo:lo + rows_per_chunk].astype(np.float32)
+        x[lo:lo + rows_per_chunk] = (c - (c @ uu)[:, None] * uu).astype(x.dtype)
+    return x

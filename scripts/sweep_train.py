@@ -32,7 +32,8 @@ from medinterp.data.archive import DEFAULT_RUN_DIR
 from medinterp.data.manifests import DEFAULT_LABEL_DIR
 from medinterp.runinfo import git_revision, package_versions, sha256_file
 from medinterp.stage0_v1 import load_context
-from medinterp.sweep import load_tokens_fp16, parse_rows, subset_train_images, token_rows, train_run
+from medinterp.sweep import (load_tokens_fp16, parse_rows, remove_component, subset_train_images, token_rows,
+                             top_component, train_run, train_token_covariance)
 
 REPO = Path(__file__).resolve().parents[1]
 ROOT = Path(os.environ.get("MEDINTERP_DATA", REPO))
@@ -85,8 +86,16 @@ def main() -> None:
         run_info = {"split_sha256": sha256_file(args.split_file), "git_revision": git_revision(REPO),
                     "packages": package_versions(), "config_file": str(args.config),
                     "subset_seed": SUBSET_SEED}
+        projected = None    # the tokens without their first principal component, built once if a row needs them
         for r in todo:
             row = table.loc[r]
+            inputs = data
+            if str(row.get("projection", "none")) == "nopc1":
+                if projected is None:
+                    log("computing the train-token covariance and removing its top component (phase 2f)")
+                    u = top_component(train_token_covariance(ctx.acts, ctx.masks))
+                    projected = {d: remove_component(a.copy(), u) for d, a in data.items()}
+                inputs = projected
             images = subset_train_images(train_masks, ctx.groups, float(row.data_fraction), SUBSET_SEED)
             train_rows = {d: token_rows(images[d], ctx.acts.n_patches) for d in data}
             run_dir = args.out / row.run_id
@@ -98,7 +107,7 @@ def main() -> None:
                     f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
             log(f"row {r} {row.run_id}: train tokens {sum(len(v) for v in train_rows.values())}")
-            res = train_run(row, data, train_rows, args.out, device, deadline, run_logger, args.state_every,
+            res = train_run(row, inputs, train_rows, args.out, device, deadline, run_logger, args.state_every,
                             run_info={**run_info, "n_train_images": {d: int(m.sum()) for d, m in images.items()}})
             log(f"row {r} {row.run_id}: {res.status} at step {res.step} ({res.seconds / 60:.1f} min)")
             if res.status == "paused":
