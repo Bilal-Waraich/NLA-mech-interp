@@ -158,3 +158,10 @@ def test_nearest_null_k_and_p11_by_architecture():
     assert relu.gap == pytest.approx(0.90 - 0.85)
     ref = table.loc["d1024_k8_s80000"]
     assert ref.architecture == "batchtopk" and ref.null_k == 8 and ref.mean_l0 == 8.0
+
+
+def test_recovery_mean_leaves_out_dataset_identity():
+    se = _sweep_eval()
+    rows = [{"target": "opacity_a", "recovered_share": 0.9}, {"target": "sex", "recovered_share": 0.7},
+            {"target": "dataset_a", "recovered_share": -3.0}]
+    assert se.recovery_mean(rows) == pytest.approx(0.8)

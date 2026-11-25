@@ -92,6 +92,17 @@ ROBUST_SEEDS = 5
 ABLATION_NS = (5, 20)
 CONFOUNDERS = ("Support Devices", "sex", "view")
 PHASE3_ARCHITECTURE_PHASES = ("3m", "3r")
+# The development tokens are centred per dataset with the mean over all of a dataset's images, so train and val
+# means of a dataset mirror each other and a dataset-identity probe anti-predicts on val (AUROC < 0.5 on the
+# originals). Performance recovery leaves those probes out on such tokens (protocol section 4, change log
+# 2026-11-25).
+RECOVERY_EXCLUDED_PREFIXES = ("dataset_",)
+
+
+def recovery_mean(rows: list[dict]) -> float | None:
+    """Mean recovered share over the probes that count for performance recovery (protocol section 4)."""
+    kept = [r["recovered_share"] for r in rows if not r["target"].startswith(RECOVERY_EXCLUDED_PREFIXES)]
+    return float(np.nanmean(kept)) if kept else None
 
 
 def log(msg: str) -> None:
@@ -435,7 +446,7 @@ def further_dictionary(name: str, kind: str, enc, ctx, keep, probes: RecoveryPro
     recovery = probes.score(decode_pooled(enc, feats.mean_codes), N_BOOT, CONFIDENCE, SEED)
     codes = {d: c.astype(np.float32) for d, c in feats.max_codes.items()}
     out = {"dictionary": name, "kind": kind, "recovery": recovery,
-           "mean_recovered_share": float(np.nanmean([r["recovered_share"] for r in recovery])) if recovery else None}
+           "mean_recovered_share": recovery_mean(recovery)}
     if "chexpert" in codes:
         labels = {lab: targets[lab]["chexpert"] for lab in targets if lab in (
             "Lung Opacity", "Consolidation", "Pneumonia", "Edema", "Atelectasis")}
@@ -459,7 +470,8 @@ def run_further(settings: dict, ctx, device: str, out: Path, force: bool) -> Non
     keep = {d: ctx.masks[d]["train"] | ctx.masks[d][EVAL_SPLIT] for d in ctx.acts.blocks}
     targets = secondary_targets(ctx.manifests, ctx.opacity)
     log(f"further: {len(targets)} targets; fitting recovery probes on pooled originals")
-    probes = RecoveryProbes(pooled_activations(ctx.acts, keep), targets, ctx.masks, ctx.groups,
+    recovery_targets = {t: v for t, v in targets.items() if not t.startswith(RECOVERY_EXCLUDED_PREFIXES)}
+    probes = RecoveryProbes(pooled_activations(ctx.acts, keep), recovery_targets, ctx.masks, ctx.groups,
                             "train", "val", EVAL_SPLIT)
     pd.DataFrame([{"target": t, "auroc_orig": a} for t, a in probes.orig_auc.items()]).to_csv(
         out / "recovery_probes.csv", index=False)
