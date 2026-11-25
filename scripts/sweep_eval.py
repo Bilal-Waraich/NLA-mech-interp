@@ -12,6 +12,12 @@ Per (d_sae, k): the nulls of P1.1 at matched sparsity (random SAEs, signed PCA a
 train tokens, and the frozen-random-decoder run of phase 1n where it exists).
 
 ``--phase0`` adds the Stage 0.6 seeds 0-2 (fitted on all images) as setting ``phase0_alldata_d4096_k48``.
+``--further`` adds the further measures of protocol section 4 (2026-11-25) at each setting's last checkpoint:
+joint seed overlap and PW-MCC per seed pair; per dictionary (trained runs and the matched-sparsity nulls)
+performance recovery, absorption on the CheXpert hierarchy and targeted ablation of confounders
+(``<out>/further/``). On the development data, latents and probes are selected on train (C tuned on val)
+and measured on val, because the test split is not read here. P1.1 for the phase 3 architectures at
+their measured L0 goes to ``p11_architectures.csv``.
 ``--probes`` additionally runs ``stage0_metrics.py --protocol v1`` on the final checkpoints of the listed
 settings (P1.2 and selectivity, on the val split). ``--per-latent`` adds the per-latent check of protocol
 section 5 (``<out>/per_latent/``). ``--subspace`` adds subspace reproducibility (``<out>/subspace/``). ``--skip-sweep-metrics`` runs only these
@@ -47,6 +53,9 @@ from medinterp.data.manifests import DEFAULT_LABEL_DIR
 from medinterp.dictionaries.baselines import covariance_directions, random_sae, signed_basis, signed_pca
 from medinterp.dictionaries.sae import TopKSAE
 from medinterp.eval.stability import TokenMoments, cosine_matrix, one_to_one
+from medinterp.eval.further_measures import (RecoveryProbes, absorption, decode_pooled, image_features,
+                                             joint_seed_overlap, pooled_activations, secondary_targets,
+                                             targeted_ablation)
 from medinterp.eval.stats import complete_separation
 from medinterp.eval.subspace import (effective_rank, explained_variance_in, matched_subset, overlap_of,
                                      project_out, right_singular_basis, whitening_map,
@@ -79,6 +88,10 @@ SUBSET_NULL_QUANTILE = 0.95
 WHITENING_VARIANCE_SHARE = 0.99
 ROBUST_PHASES = ("1a", "1b", "1c")
 ROBUST_SEEDS = 5
+# Protocol section 4, further measures (2026-11-25): ablated latents per confounder and the confounders.
+ABLATION_NS = (5, 20)
+CONFOUNDERS = ("Support Devices", "sex", "view")
+PHASE3_ARCHITECTURE_PHASES = ("3m", "3r")
 
 
 def log(msg: str) -> None:
@@ -152,10 +165,12 @@ def tidy(dictionary: str, d_sae, k, steps, init_seed, data_seed, metric: str, su
 def score_row(name, kind, setting, d_sae, k, step, init_seed, data_seed, sc) -> tuple[dict, list[dict]]:
     fve = {"setting": setting, "dictionary": name, "dictionary_kind": kind, "d_sae": d_sae, "k": k, "step": step,
            "init_seed": init_seed, "data_seed": data_seed, "value": sc.fve, "ci_low": sc.fve_ci[0],
-           "ci_high": sc.fve_ci[1], "n_dead": sc.n_dead, "n_every_image": sc.n_every_image}
+           "ci_high": sc.fve_ci[1], "n_dead": sc.n_dead, "n_every_image": sc.n_every_image,
+           "mean_l0": float(sc.firing_rate.sum())}
     rows = [tidy(name, d_sae, k, step, init_seed, data_seed, "fve_own_decoder", "all", sc.fve, *sc.fve_ci),
             tidy(name, d_sae, k, step, init_seed, data_seed, "n_dead_latents", "all", sc.n_dead),
-            tidy(name, d_sae, k, step, init_seed, data_seed, "n_latents_active_every_image", "all", sc.n_every_image)]
+            tidy(name, d_sae, k, step, init_seed, data_seed, "n_latents_active_every_image", "all", sc.n_every_image),
+            tidy(name, d_sae, k, step, init_seed, data_seed, "mean_l0", "all", float(sc.firing_rate.sum()))]
     return fve, rows
 
 
@@ -372,6 +387,122 @@ def run_subspace(settings: dict, tokens, cov, device: str, out: Path, force: boo
                         for r in SUBSPACE_RANKS))
 
 
+def nearest_null_k(mean_l0: float, d_sae: int, null_ks: list[tuple[int, int]]) -> int | None:
+    """The k of the null dictionaries (same size) closest to a measured mean L0; ties go to the smaller k."""
+    ks = sorted(k for d, k in null_ks if d == d_sae)
+    return min(ks, key=lambda k: (abs(k - mean_l0), k)) if ks else None
+
+
+def p11_architectures_table(fve: pd.DataFrame) -> pd.DataFrame:
+    """P1.1 for the phase 3 architectures (protocol section 5, "Phase 3"): each setting's seeds at their final
+    checkpoint against every null at the k nearest to the setting's mean measured L0, next to the measured L0
+    and FVE, so reconstruction can be read against measured sparsity at fixed width. BatchTopK at 80k
+    (phase 2a) is listed the same way as the reference."""
+    null_ks = sorted({(int(d), int(k)) for d, k in zip(fve[fve.setting.str.startswith("nulls_")].d_sae,
+                                                       fve[fve.setting.str.startswith("nulls_")].k)})
+    rows = []
+    trained = fve[(fve.dictionary_kind == "trained") & fve.setting.str.match(r"^d\d+_k\d+_s80000(_matryoshka|_relul1)?$")]
+    for setting, part in trained.groupby("setting"):
+        last = part[part.step == part.step.max()]
+        d_sae = int(last.d_sae.iloc[0])
+        l0 = float(last.mean_l0.mean()) if "mean_l0" in last else float("nan")
+        if np.isnan(l0):
+            # Caches written before mean L0 was recorded hold BatchTopK runs, whose per-token top-k fixes L0 at
+            # k (at most; fewer only where pre-activations are not positive).
+            l0 = float(last.k.iloc[0])
+        k_null = nearest_null_k(l0, d_sae, null_ks)
+        if k_null is None:
+            continue
+        nulls = fve[(fve.setting == f"nulls_d{d_sae}_k{k_null}")
+                    | ((fve.setting == f"d{d_sae}_k{k_null}_s20000_frozeniso") & (fve.step == 20_000))]
+        sep = complete_separation(last.value.to_numpy(), nulls.value.to_numpy())
+        best = nulls.loc[nulls.value.idxmax()]
+        architecture = ("matryoshka" if setting.endswith("_matryoshka") else
+                        "relu_l1" if setting.endswith("_relul1") else "batchtopk")
+        rows.append({"setting": setting, "architecture": architecture, "d_sae": d_sae, "row_k": int(last.k.iloc[0]),
+                     "step": int(last.step.iloc[0]), "n_trained": len(last), "mean_l0": l0,
+                     "mean_l0_min": float(last.mean_l0.min()), "mean_l0_max": float(last.mean_l0.max()),
+                     "fve_mean": float(last.value.mean()), "worst_trained": float(last.value.min()),
+                     "null_k": k_null, "n_null": len(nulls), "best_null": best.dictionary,
+                     "best_null_value": best.value, "gap": sep.gap, "separated": sep.separated,
+                     "p_exact": sep.p_value})
+    return pd.DataFrame(rows)
+
+
+def further_dictionary(name: str, kind: str, enc, ctx, keep, probes: RecoveryProbes, targets, device: str) -> dict:
+    """Performance recovery, absorption and targeted ablation of one dictionary (protocol section 4)."""
+    feats = image_features(ctx.acts, enc, keep, device)
+    recovery = probes.score(decode_pooled(enc, feats.mean_codes), N_BOOT, CONFIDENCE, SEED)
+    codes = {d: c.astype(np.float32) for d, c in feats.max_codes.items()}
+    out = {"dictionary": name, "kind": kind, "recovery": recovery,
+           "mean_recovered_share": float(np.nanmean([r["recovered_share"] for r in recovery])) if recovery else None}
+    if "chexpert" in codes:
+        labels = {lab: targets[lab]["chexpert"] for lab in targets if lab in (
+            "Lung Opacity", "Consolidation", "Pneumonia", "Edema", "Atelectasis")}
+        if len(labels) == 5:
+            m = ctx.masks["chexpert"]
+            out["absorption"] = absorption(codes["chexpert"], labels, m["train"], m[EVAL_SPLIT])
+    comparisons = tuple(t for t in targets if t.startswith("opacity_"))
+    out["ablation"] = targeted_ablation(codes, targets, ctx.masks, CONFOUNDERS, comparisons, ABLATION_NS,
+                                        "train", "val", EVAL_SPLIT)
+    return out
+
+
+def run_further(settings: dict, ctx, device: str, out: Path, force: bool) -> None:
+    """Further measures of protocol section 4 for every trained setting (and its matched nulls) at the last
+    common checkpoint. Settings trained on projected tokens (phase 2f) and the ReLU+L1 calibration are skipped."""
+    out.mkdir(parents=True, exist_ok=True)
+    chosen = {n: v for n, v in settings.items() if v["meta"]["kind"] == "trained" and n != PHASE0
+              and v["meta"].get("projection", "none") == "none" and v["meta"]["phase"] != "3c"}
+    if not chosen:
+        return
+    keep = {d: ctx.masks[d]["train"] | ctx.masks[d][EVAL_SPLIT] for d in ctx.acts.blocks}
+    targets = secondary_targets(ctx.manifests, ctx.opacity)
+    log(f"further: {len(targets)} targets; fitting recovery probes on pooled originals")
+    probes = RecoveryProbes(pooled_activations(ctx.acts, keep), targets, ctx.masks, ctx.groups,
+                            "train", "val", EVAL_SPLIT)
+    pd.DataFrame([{"target": t, "auroc_orig": a} for t, a in probes.orig_auc.items()]).to_csv(
+        out / "recovery_probes.csv", index=False)
+    pca_sample = None
+    done_nulls = set()
+    for name, info in chosen.items():
+        target_file = out / f"{name}.json"
+        if target_file.exists() and not force:
+            continue
+        runs = info["runs"]
+        step = max(set.intersection(*(set(r["steps"]) for r in runs.values())))
+        order = sorted(runs, key=lambda r: (runs[r]["init_seed"], runs[r]["data_seed"]))
+        saes = {r: TopKSAE.from_checkpoint(runs[r]["steps"][step]) for r in order}
+        result = {"setting": name, "d_sae": info["meta"]["d_sae"], "k": info["meta"]["k"], "step": step,
+                  "pairs": [], "dictionaries": []}
+        for i, a in enumerate(order):
+            for b in order[i + 1:]:
+                result["pairs"].append({"run_a": a, "run_b": b, **joint_seed_overlap(saes[a], saes[b], S_THRESHOLD)})
+        for r in order:
+            result["dictionaries"].append(further_dictionary(r, "trained", saes[r], ctx, keep, probes, targets, device))
+            d = result["dictionaries"][-1]
+            log(f"further {name} {r}: recovered share {d['mean_recovered_share']:.3f}")
+        target_file.write_text(json.dumps(result, indent=1, default=float))
+        # The matched nulls of this (d_sae, k), once per pair: the same measures under the same rules.
+        key = (info["meta"]["d_sae"], info["meta"]["k"])
+        null_file = out / f"nulls_d{key[0]}_k{key[1]}.json"
+        if key in done_nulls or (null_file.exists() and not force):
+            continue
+        if pca_sample is None:
+            pca_sample = train_token_sample(ctx, PCA_TOKENS_PER_DATASET, SEED)
+        d_model = ctx.acts.d_model
+        nulls = {f"random_seed{s}": random_sae(d_model, key[0], key[1], seed=s) for s in RANDOM_SAE_SEEDS}
+        nulls["signed_pca"] = signed_pca(pca_sample, d_model, key[1])
+        nulls["signed_basis"] = signed_basis(d_model, key[1])
+        null_result = {"d_sae": key[0], "k": key[1], "dictionaries": [
+            further_dictionary(n, "random_sae" if n.startswith("random") else n, enc, ctx, keep, probes, targets, device)
+            for n, enc in nulls.items()]}
+        null_file.write_text(json.dumps(null_result, indent=1, default=float))
+        done_nulls.add(key)
+        log(f"further nulls d{key[0]} k{key[1]}: recovered share "
+            + ", ".join(f"{d['dictionary']} {d['mean_recovered_share']:.3f}" for d in null_result["dictionaries"]))
+
+
 def p11_table(fve: pd.DataFrame) -> pd.DataFrame:
     """P1.1 per (d_sae, k) at the final 20k checkpoint of phase-1 settings: trained seeds vs every null."""
     rows = []
@@ -515,6 +646,8 @@ def main() -> None:
                     help="also run the subspace-reproducibility check (protocol section 5) on the finished settings")
     ap.add_argument("--subspace-robust", action="store_true",
                     help="also run the subspace robustness checks of protocol section 5 (2026-11-24)")
+    ap.add_argument("--further", action="store_true",
+                    help="also run the further measures of protocol section 4 (2026-11-25) on the finished settings")
     ap.add_argument("--skip-sweep-metrics", action="store_true",
                     help="skip the per-setting sweep metrics and their aggregation (with --per-latent or --probes)")
     ap.add_argument("--force", action="store_true")
@@ -581,7 +714,8 @@ def main() -> None:
 
     pca_sample = None
     for d_sae, k in sorted({(v["meta"]["d_sae"], v["meta"]["k"]) for v in to_evaluate.values()
-                            if v["meta"]["kind"] == "trained" and v["meta"].get("projection", "none") == "none"}):
+                            if v["meta"]["kind"] == "trained" and v["meta"].get("projection", "none") == "none"
+                            and v["meta"]["phase"] != "3c"}):
         f = cache / "nulls" / f"d{d_sae}_k{k}.json"
         if f.exists() and not args.force:
             continue
@@ -601,6 +735,8 @@ def main() -> None:
         if args.subspace_robust:
             tok, cv = need_tokens()
             run_subspace_robust(settings, tok, cv, device, args.out / "subspace_robust", args.force)
+        if args.further:
+            run_further(settings, ctx, device, args.out / "further", args.force)
         if args.probes is not None:
             run_probes(settings, args.probes or list(settings), args)
         log(f"wrote {args.out}")
@@ -621,11 +757,18 @@ def main() -> None:
         p11.to_csv(args.out / "p11.csv", index=False)
         if not p11.empty:
             log("P1.1 (val, exploratory):\n" + p11.to_string(index=False))
+        if "mean_l0" in fve:
+            arch = p11_architectures_table(fve)
+            arch.to_csv(args.out / "p11_architectures.csv", index=False)
+            if not arch.empty:
+                log("P1.1 by architecture at measured L0 (val, exploratory):\n" + arch.to_string(index=False))
     if args.per_latent and settings:
         run_per_latent(settings, need_tokens(with_covariance=False)[0], device, args.out / "per_latent", args.force)
     if args.subspace and settings:
         tok, cv = need_tokens()
         run_subspace(settings, tok, cv, device, args.out / "subspace", args.force)
+    if args.further and settings:
+        run_further(settings, ctx, device, args.out / "further", args.force)
     if args.probes is not None:
         run_probes(settings, args.probes or list(settings), args)
     log(f"wrote {args.out}")
