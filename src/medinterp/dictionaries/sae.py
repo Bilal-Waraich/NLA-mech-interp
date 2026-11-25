@@ -48,6 +48,8 @@ class TopKSAE:
         Complexity: O(B * d_model * d_sae) for the matmul plus O(B * d_sae) for top-k.
         """
         pre = torch.relu((x - self.b_dec) @ self.W_enc + self.b_enc)
+        if self.k >= self.d_sae:  # ReLU+L1 dictionaries (k = d_sae): top-k over all latents is the identity
+            return pre
         top = torch.topk(pre, self.k, dim=-1)
         return torch.zeros_like(pre).scatter_(-1, top.indices, top.values)
 

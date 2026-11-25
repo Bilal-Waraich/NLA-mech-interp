@@ -18,6 +18,16 @@ Options added for the protocol (all default to the behaviour above, which tests/
   train_rows              restricts sampling to the given token rows per dataset (e.g. the train split)
   checkpoint_steps        steps at which a copy of the dictionary is handed to ``on_checkpoint``
   fixed_decoder           a decoder that is never updated (frozen-decoder baseline); the encoder is trained
+  architecture            "batchtopk" (default), "matryoshka" or "relu_l1" (WP1 phase 3, protocol section 5)
+
+Phase 3 architectures (build spec WP1):
+  matryoshka  BatchTopK selection as above; the reconstruction loss is the sum of the losses of the nested
+              prefixes ``matryoshka_fractions`` of the latents (each prefix decodes only its own codes, plus
+              b_dec), after Bussmann et al. 2025. L1, auxiliary loss and inference are those of BatchTopK.
+  relu_l1     ReLU encoder without top-k, L1 on the codes (the run's ``l1_coeff``) and no auxiliary loss: the
+              dead-latent loss belongs to TopK training (Gao et al. 2024) and has no counterpart in the
+              classic ReLU recipe. Snapshots get k = d_sae, so inference is the plain ReLU code and L0 is
+              measured, not set.
 """
 from __future__ import annotations
 
@@ -51,6 +61,8 @@ class TrainConfig:
     data_seed: int | None = None
     sampling: str = "equal"
     checkpoint_steps: tuple[int, ...] = ()
+    architecture: str = "batchtopk"
+    matryoshka_fractions: tuple[float, ...] = (1 / 16, 1 / 8, 1 / 4, 1 / 2, 1.0)
 
     @property
     def resolved_init_seed(self) -> int:
@@ -66,6 +78,28 @@ def _lr_factor(step: int, cfg: TrainConfig) -> float:
         return step / max(1, cfg.warmup)
     progress = (step - cfg.warmup) / max(1, cfg.steps - cfg.warmup)
     return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+ARCHITECTURES = ("batchtopk", "matryoshka", "relu_l1")
+
+
+def matryoshka_prefixes(d_sae: int, fractions: tuple[float, ...]) -> tuple[int, ...]:
+    """Prefix sizes in latents for the nested losses; the last must be the whole dictionary.
+
+    Raises ValueError if the fractions are not increasing, do not end at 1, or give a prefix that is not a
+    whole, non-empty number of latents.
+    """
+    sizes = tuple(round(f * d_sae) for f in fractions)
+    if not fractions or fractions[-1] != 1.0 or any(b <= a for a, b in zip(sizes, sizes[1:])):
+        raise ValueError(f"matryoshka fractions must increase to 1.0, got {fractions}")
+    if any(s < 1 or abs(s - f * d_sae) > 1e-9 for s, f in zip(sizes, fractions)):
+        raise ValueError(f"fractions {fractions} do not give whole prefixes of {d_sae} latents")
+    return sizes
+
+
+def inference_k(cfg: "TrainConfig") -> int:
+    """k used by the saved dictionary: the run's k, or every latent for ReLU+L1 (the plain ReLU code)."""
+    return cfg.d_sae if cfg.architecture == "relu_l1" else cfg.k
 
 
 class _BatchSampler:
@@ -132,6 +166,11 @@ class BatchTopKTrainer:
                  train_rows: dict[str, np.ndarray] | None = None,
                  on_checkpoint: Callable[[int, TopKSAE], None] | None = None,
                  fixed_decoder: torch.Tensor | None = None) -> None:
+        if cfg.architecture not in ARCHITECTURES:
+            raise ValueError(f"architecture must be one of {ARCHITECTURES}, got {cfg.architecture!r}")
+        # Checked before any random number is drawn, so a bad config fails without side effects.
+        self.prefixes = (matryoshka_prefixes(cfg.d_sae, cfg.matryoshka_fractions)
+                         if cfg.architecture == "matryoshka" else (cfg.d_sae,))
         self.cfg, self.log, self.on_checkpoint = cfg, log, on_checkpoint
         self.frozen_decoder = fixed_decoder is not None
         torch.manual_seed(cfg.resolved_init_seed)
@@ -179,9 +218,22 @@ class BatchTopKTrainer:
             B = x.shape[0]
 
             pre = torch.relu((x - params["b_dec"]) @ params["W_enc"] + params["b_enc"])
-            top = torch.topk(pre.flatten(), cfg.k * B)                      # BatchTopK
-            z = torch.zeros_like(pre.flatten()).scatter(-1, top.indices, top.values).view_as(pre)
-            x_hat = z @ params["W_dec"] + params["b_dec"]
+            if cfg.architecture == "relu_l1":
+                z = pre
+            else:
+                top = torch.topk(pre.flatten(), cfg.k * B)                  # BatchTopK
+                z = torch.zeros_like(pre.flatten()).scatter(-1, top.indices, top.values).view_as(pre)
+            if cfg.architecture == "matryoshka":
+                # Nested reconstructions built up group by group; the prefix sizes are fixed, so shapes stay
+                # static (see the MPS note below).
+                partial, l2_sum, lo = params["b_dec"].expand_as(x), torch.zeros((), device=dev), 0
+                for hi in self.prefixes:
+                    partial = partial + z[:, lo:hi] @ params["W_dec"][lo:hi]
+                    l2_sum = l2_sum + (partial - x).pow(2).mean()
+                    lo = hi
+                x_hat = partial
+            else:
+                x_hat = z @ params["W_dec"] + params["b_dec"]
 
             # All tensors below keep fixed shapes. Data-dependent shapes (boolean indexing such as
             # pre[:, dead]) make the MPS backend compile and cache a new graph for every distinct number
@@ -194,7 +246,7 @@ class BatchTopKTrainer:
             aux = torch.zeros((), device=dev)
             dead = self.inactive >= cfg.n_batches_to_dead
             n_dead = int(dead.sum())
-            if n_dead > 0:
+            if n_dead > 0 and cfg.architecture != "relu_l1":
                 k_aux = cfg.d_model // 2
                 scale = min(n_dead / k_aux, 1.0)
                 # Mask instead of slice: non-dead latents become 0, so when fewer than k_aux latents are
@@ -203,7 +255,8 @@ class BatchTopKTrainer:
                 t = torch.topk(pre_dead, k_aux, dim=-1)
                 z_aux = torch.zeros_like(pre_dead).scatter(-1, t.indices, t.values)
                 aux = cfg.aux_penalty * scale * (z_aux @ params["W_dec"] - (x - x_hat).detach()).pow(2).mean()
-            loss = l2 + l1 + aux
+            # For Matryoshka the full-dictionary term is the last prefix, so l2_sum already contains l2.
+            loss = (l2_sum if cfg.architecture == "matryoshka" else l2) + l1 + aux
 
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -229,7 +282,7 @@ class BatchTopKTrainer:
                 return
 
     def snapshot(self) -> TopKSAE:
-        return _snapshot(self.params, self.cfg.k)
+        return _snapshot(self.params, inference_k(self.cfg))
 
     def state_dict(self) -> dict:
         """CPU copy of everything needed to continue; the batch RNG state is a plain dict."""
