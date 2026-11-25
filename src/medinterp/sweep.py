@@ -34,9 +34,11 @@ from .dictionaries.sae import TopKSAE
 from .dictionaries.train import BatchTopKTrainer, TrainConfig
 
 SWEEP_COLUMNS = ["row", "phase", "setting", "run_id", "decoder", "d_sae", "k", "steps", "init_seed",
-                 "data_seed", "sampling", "l1_coeff", "data_fraction", "checkpoints", "run_units", "projection"]
+                 "data_seed", "sampling", "l1_coeff", "data_fraction", "checkpoints", "run_units", "projection",
+                 "architecture"]
 # "projection" says which input the run sees: "none" (the tokens as harvested) or "nopc1" (the top eigenvector
-# of the train-token covariance projected out; phase 2f).
+# of the train-token covariance projected out; phase 2f). "architecture" is "batchtopk" for every row before
+# phase 3; tables written before the column existed are read as all "batchtopk" (``row_architecture``).
 PHASE1_KS = (4, 8, 16, 32, 48)
 # Phase 1c: larger k at 1,024 latents, added after the decoder diagnostic had no minimum up to k = 48, and
 # k = 64 at 4,096 latents, added afterwards for a matched size comparison at k = 32, 48 and 64.
@@ -57,6 +59,13 @@ CONVERGENCE_SETTINGS = ((1024, 8), (1024, 16))
 NOPC1_SETTINGS = ((1024, 8), (1024, 16), (1024, 32), (4096, 32), (4096, 48))
 # Phase 2g (protocol section 5): the data-amount test of phase 2c repeated at the phase 2a length.
 DATA_AT_LENGTH_SETTINGS = ((1024, 8), (1024, 16), (1024, 32))
+# Phase 3 (protocol section 5, "Phase 3"): further architectures at the core settings, 80k steps, 5 seeds.
+# ReLU+L1 is calibrated first: 1 seed, 20k steps, 8 log-spaced L1 coefficients per dictionary size. The grid's
+# range is set from a short pilot (scripts/sweep_relu_pilot.py; track A notes, phase 3) before the calibration
+# rows are written into the run table; until then ``sweep_table`` leaves them out.
+PHASE3_SEEDS = 5
+RELU_CALIBRATION_D_SAE = (1024, 4096)
+RELU_L1_GRID: tuple[float, ...] = ()
 
 # Settings carried forward, as (d_sae, k); roles and rules are in protocol section 5.
 CORE_SETTINGS = ((1024, 8), (1024, 16), (1024, 32), (4096, 32))
@@ -92,14 +101,14 @@ def setting_name(d_sae: int, k: int, steps: int, variant: str = "") -> str:
 def _row(phase: str, d_sae: int, k: int, init_seed: int, data_seed: int, *, steps: int = BASE_STEPS,
          sampling: str = "equal", l1_coeff: float = BASE_L1, data_fraction: float = 1.0,
          decoder: str = "trained", checkpoints: tuple[int, ...] = BASE_CHECKPOINTS, variant: str = "",
-         setting: str | None = None, projection: str = "none") -> dict:
+         setting: str | None = None, projection: str = "none", architecture: str = "batchtopk") -> dict:
     setting = setting or setting_name(d_sae, k, steps, variant)
     run_id = f"{setting_name(d_sae, k, steps, variant)}_i{init_seed}_b{data_seed}"
     return {"phase": phase, "setting": setting, "run_id": run_id, "decoder": decoder, "d_sae": d_sae, "k": k,
             "steps": steps, "init_seed": init_seed, "data_seed": data_seed, "sampling": sampling,
             "l1_coeff": l1_coeff, "data_fraction": data_fraction,
             "checkpoints": ";".join(str(c) for c in checkpoints), "run_units": run_units(d_sae, steps),
-            "projection": projection}
+            "projection": projection, "architecture": architecture}
 
 
 def _training_length_rows(d_sae: int, k: int) -> list[dict]:
@@ -156,11 +165,71 @@ def sweep_table(full: bool = False) -> pd.DataFrame:
             for frac, tag in ((0.25, "frac25"), (0.5, "frac50")):
                 rows += [_row("2g", d_sae, k, s, s, steps=LONG_STEPS, checkpoints=LONG_CHECKPOINTS,
                               data_fraction=frac, variant=tag) for s in range(3)]
+        rows += phase3_rows()
     table = pd.DataFrame(rows)
     table.insert(0, "row", np.arange(len(table)))
     if not table.run_id.is_unique:
         raise AssertionError("duplicate run ids in the sweep table")
     return table[SWEEP_COLUMNS]
+
+
+def relu_calibration_variant(l1_coeff: float) -> str:
+    return f"relul1_{l1_coeff:.3g}"
+
+
+def phase3_rows() -> list[dict]:
+    """Phase 3 rows: Matryoshka at the core settings (phase "3m"), then the ReLU+L1 calibration (phase "3c").
+    Matryoshka comes first because it was pushed before the calibration grid was set from the pilot; the
+    ReLU+L1 runs at the calibrated coefficients are appended after the calibration has been read
+    (``relu_main_rows``).
+
+    Calibration rows have k = d_sae: ReLU+L1 has no k, and the saved dictionary encodes with every latent.
+    """
+    rows = []
+    for d_sae, k in CORE_SETTINGS:
+        rows += [_row("3m", d_sae, k, s, s, steps=LONG_STEPS, checkpoints=LONG_CHECKPOINTS, variant="matryoshka",
+                      architecture="matryoshka") for s in range(PHASE3_SEEDS)]
+    for d_sae in RELU_CALIBRATION_D_SAE if RELU_L1_GRID else ():
+        rows += [_row("3c", d_sae, d_sae, 0, 0, l1_coeff=c, variant=relu_calibration_variant(c),
+                      architecture="relu_l1") for c in RELU_L1_GRID]
+    return rows
+
+
+def relu_main_rows(coefficients: Mapping[tuple[int, int], float]) -> list[dict]:
+    """ReLU+L1 at the core settings, 5 seeds at 80k, with the calibrated L1 coefficient per (d_sae, k).
+
+    The k column holds the target L0 the coefficient was matched to; training ignores it. Raises KeyError if
+    a core setting has no coefficient.
+    """
+    rows = []
+    for d_sae, k in CORE_SETTINGS:
+        c = coefficients[(d_sae, k)]
+        rows += [_row("3r", d_sae, k, s, s, steps=LONG_STEPS, checkpoints=LONG_CHECKPOINTS, l1_coeff=c,
+                      variant="relul1", architecture="relu_l1") for s in range(PHASE3_SEEDS)]
+    return rows
+
+
+def pick_l1_coefficients(calibration: pd.DataFrame) -> dict[tuple[int, int], float]:
+    """Calibration rule of protocol section 5, phase 3: per core setting, the coefficient of that dictionary
+    size whose measured mean L0 on val is closest to k (ties: the larger coefficient, i.e. the sparser run).
+
+    ``calibration`` has columns ``d_sae, l1_coeff, mean_l0``. Raises ValueError if a core size has no row.
+    """
+    out = {}
+    for d_sae, k in CORE_SETTINGS:
+        part = calibration[calibration.d_sae == d_sae]
+        if part.empty:
+            raise ValueError(f"no calibration runs at {d_sae} latents")
+        dist = (part.mean_l0 - k).abs()
+        best = part[dist == dist.min()].l1_coeff.max()
+        out[(d_sae, k)] = float(best)
+    return out
+
+
+def row_architecture(row) -> str:
+    """The row's architecture; tables written before phase 3 have no column and are all BatchTopK."""
+    value = row.get("architecture", "batchtopk") if hasattr(row, "get") else "batchtopk"
+    return "batchtopk" if pd.isna(value) else str(value)
 
 
 def parse_rows(spec: str, n_rows: int) -> list[int]:
@@ -241,7 +310,8 @@ def train_config(row) -> TrainConfig:
     return TrainConfig(d_sae=int(row["d_sae"]), k=int(row["k"]), steps=int(row["steps"]),
                        seed=int(row["init_seed"]), init_seed=int(row["init_seed"]),
                        data_seed=int(row["data_seed"]), sampling=str(row["sampling"]),
-                       l1_coeff=float(row["l1_coeff"]), checkpoint_steps=checkpoint_steps(row))
+                       l1_coeff=float(row["l1_coeff"]), checkpoint_steps=checkpoint_steps(row),
+                       architecture=row_architecture(row))
 
 
 @dataclass
@@ -274,13 +344,14 @@ def train_run(row, data: dict[str, np.ndarray], train_rows: dict[str, np.ndarray
         fixed = isotropic_directions(cfg.d_sae, cfg.d_model, int(row["init_seed"]))
     elif row["decoder"] != "trained":
         raise ValueError(f"unknown decoder kind {row['decoder']!r}")
-    cfg_dict = {**asdict(cfg), "architecture": "batch_topk", "decoder": row["decoder"], "fit_split": "train",
+    cfg_dict = {**asdict(cfg), "decoder": row["decoder"], "fit_split": "train",
                 "data_fraction": float(row["data_fraction"]), "phase": row["phase"],
                 "setting": row["setting"], "run_id": row["run_id"], "device": device, **(run_info or {})}
     (out / "config.json").write_text(json.dumps(cfg_dict, indent=2, default=str))
 
     def on_checkpoint(step: int, sae: TopKSAE) -> None:
-        save_dictionary(sae, out / f"step_{step}", {**cfg_dict, "step": step})
+        # "k" is what TopKSAE.from_checkpoint encodes with: d_sae for ReLU+L1, whose row k is only the target L0.
+        save_dictionary(sae, out / f"step_{step}", {**cfg_dict, "step": step, "k": sae.k, "row_k": int(row["k"])})
 
     trainer = BatchTopKTrainer(data, cfg, device, log, train_rows, on_checkpoint, fixed)
     state_path = out / "state.pt"

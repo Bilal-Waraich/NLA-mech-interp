@@ -28,10 +28,10 @@ def test_table_phase_one_matches_protocol():
 
 def test_later_phases_are_appended_without_renumbering():
     base, full = sweep_table(), sweep_table(full=True)
-    assert len(base) == 58 and len(full) == 172
+    assert len(base) == 58 and len(full) >= 192
     assert set(full.iloc[133:139].phase) == {"2e"} and set(full.iloc[133:139].steps) == {160_000}
     assert full.iloc[:len(base)].equals(base)
-    assert full.run_units.sum() == pytest.approx(165.25)
+    assert full.iloc[:172].run_units.sum() == pytest.approx(165.25)
     tail = full.iloc[130:133]
     assert set(tail.phase) == {"2a"} and set(tail.setting) == {"d1024_k64_s80000"}
     # Phase 2 was decided before phase 1c, so it keeps rows 58-114 and phase 1c follows.
@@ -288,7 +288,7 @@ def test_phase_2f_and_2g_rows():
     g = full[full.phase == "2g"]
     assert len(g) == 18 and set(g.data_fraction) == {0.25, 0.5} and set(g.projection) == {"none"}
     assert set(full[~full.phase.isin(("2f",))].projection) == {"none"}
-    assert list(full.iloc[139:].phase.unique()) == ["2f", "2g"]
+    assert list(full.iloc[139:172].phase.unique()) == ["2f", "2g"]
 
 
 def test_remove_component_matches_dense_projection():
@@ -302,3 +302,60 @@ def test_remove_component_matches_dense_projection():
     assert np.allclose(out @ u, 0, atol=1e-4)
     t = remove_component(torch.from_numpy(x.astype(np.float32)), u, rows_per_chunk=64)
     assert np.allclose(t.numpy(), out, atol=1e-5)
+
+
+def test_phase_3_rows(monkeypatch):
+    import medinterp.sweep as sweep
+    from medinterp.sweep import CORE_SETTINGS
+    full = sweep_table(full=True)
+    assert set(full.iloc[:172].architecture) == {"batchtopk"}
+    assert set(full.iloc[172:192].phase) == {"3m"}
+    grid = (0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128)
+    monkeypatch.setattr(sweep, "RELU_L1_GRID", grid)
+    with_grid = sweep_table(full=True)
+    assert with_grid.iloc[:192].equals(full.iloc[:192])
+    c = with_grid[with_grid.phase == "3c"]
+    assert len(c) == 16 and set(c.architecture) == {"relu_l1"} and list(c.index) == list(range(192, 208))
+    assert set(c.steps) == {20_000} and (c.k == c.d_sae).all() and set(c.init_seed) == {0}
+    assert sorted(set(c.l1_coeff)) == sorted(grid)
+    m = full[full.phase == "3m"]
+    assert set(m.architecture) == {"matryoshka"} and set(m.steps) == {80_000} and set(m.l1_coeff) == {2e-4}
+    assert set(zip(m.d_sae, m.k)) == set(CORE_SETTINGS) and (m.groupby("setting").size() == 5).all()
+
+
+def test_relu_coefficients_and_main_rows():
+    from medinterp.sweep import CORE_SETTINGS, pick_l1_coefficients, relu_main_rows
+    cal = pd.DataFrame({"d_sae": [1024] * 4 + [4096] * 2, "l1_coeff": [0.1, 0.05, 0.01, 0.005, 0.05, 0.01],
+                        "mean_l0": [6.0, 10.0, 15.0, 40.0, 20.0, 44.0]})
+    picked = pick_l1_coefficients(cal)
+    # k = 8: 6 and 10 are equally close, the sparser (larger) coefficient wins.
+    assert picked == {(1024, 8): 0.1, (1024, 16): 0.01, (1024, 32): 0.005, (4096, 32): 0.05}
+    rows = pd.DataFrame(relu_main_rows(picked))
+    assert len(rows) == 20 and set(rows.architecture) == {"relu_l1"} and set(rows.steps) == {80_000}
+    assert set(zip(rows.d_sae, rows.k)) == set(CORE_SETTINGS) and rows.run_id.is_unique
+    with pytest.raises(ValueError):
+        pick_l1_coefficients(cal[cal.d_sae == 1024])
+
+
+def test_rows_without_architecture_column_are_batchtopk(tmp_path):
+    from medinterp.sweep import row_architecture, train_config
+    row = _row()
+    assert "architecture" not in row and row_architecture(row) == "batchtopk"
+    assert train_config(row).architecture == "batchtopk"
+    assert train_config(_row(architecture="matryoshka")).architecture == "matryoshka"
+
+
+@pytest.mark.parametrize("architecture", ["matryoshka", "relu_l1"])
+def test_phase_3_runs_pause_resume_and_save(tmp_path, architecture):
+    data, rows = _data(), {"a": np.arange(400), "b": np.arange(300)}
+    quiet = lambda *_: None
+    row = _row(architecture=architecture, d_sae=64)
+    train_run(row, data, rows, tmp_path / "full", "cpu", time.time() + 3600, quiet, state_every=10)
+    train_run(row, data, rows, tmp_path / "resumed", "cpu", 0.0, quiet, state_every=10)
+    train_run(row, data, rows, tmp_path / "resumed", "cpu", time.time() + 3600, quiet, state_every=10)
+    a = TopKSAE.from_checkpoint(tmp_path / "full/toy_i0_b0/step_40")
+    b = TopKSAE.from_checkpoint(tmp_path / "resumed/toy_i0_b0/step_40")
+    assert torch.equal(a.W_dec, b.W_dec) and torch.equal(a.W_enc, b.W_enc)
+    cfg = json.loads((tmp_path / "full/toy_i0_b0/step_40/cfg.json").read_text())
+    assert cfg["architecture"] == architecture
+    assert a.k == (64 if architecture == "relu_l1" else 4)
