@@ -65,7 +65,11 @@ DATA_AT_LENGTH_SETTINGS = ((1024, 8), (1024, 16), (1024, 32))
 # rows are written into the run table; until then ``sweep_table`` leaves them out.
 PHASE3_SEEDS = 5
 RELU_CALIBRATION_D_SAE = (1024, 4096)
-RELU_L1_GRID: tuple[float, ...] = ()
+# Pilot (2026-11-25, 5k steps): L0 between 8 and 32 lay between L1 = 0.1 and 1.0 at both sizes; longer runs
+# need a smaller coefficient for the same L0, so the grid starts lower.
+RELU_L1_GRID: tuple[float, ...] = tuple(float(f"{v:.3g}") for v in np.geomspace(0.03, 1.0, 8))
+# L1 warm-up of the ReLU+L1 runs (share of the steps), as in the standard ReLU+L1 recipe.
+RELU_L1_WARMUP_FRACTION = 0.05
 
 # Settings carried forward, as (d_sae, k); roles and rules are in protocol section 5.
 CORE_SETTINGS = ((1024, 8), (1024, 16), (1024, 32), (4096, 32))
@@ -311,7 +315,8 @@ def train_config(row) -> TrainConfig:
                        seed=int(row["init_seed"]), init_seed=int(row["init_seed"]),
                        data_seed=int(row["data_seed"]), sampling=str(row["sampling"]),
                        l1_coeff=float(row["l1_coeff"]), checkpoint_steps=checkpoint_steps(row),
-                       architecture=row_architecture(row))
+                       architecture=row_architecture(row),
+                       l1_warmup_fraction=RELU_L1_WARMUP_FRACTION if row_architecture(row) == "relu_l1" else 0.0)
 
 
 @dataclass

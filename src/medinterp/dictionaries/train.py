@@ -27,7 +27,8 @@ Phase 3 architectures (build spec WP1):
   relu_l1     ReLU encoder without top-k, L1 on the codes (the run's ``l1_coeff``) and no auxiliary loss: the
               dead-latent loss belongs to TopK training (Gao et al. 2024) and has no counterpart in the
               classic ReLU recipe. Snapshots get k = d_sae, so inference is the plain ReLU code and L0 is
-              measured, not set.
+              measured, not set. ``l1_warmup_fraction`` ramps the L1 coefficient linearly from 0 over that
+              share of the steps (the standard ReLU+L1 recipe uses 5%; it keeps latents from dying early).
 """
 from __future__ import annotations
 
@@ -62,6 +63,7 @@ class TrainConfig:
     sampling: str = "equal"
     checkpoint_steps: tuple[int, ...] = ()
     architecture: str = "batchtopk"
+    l1_warmup_fraction: float = 0.0
     matryoshka_fractions: tuple[float, ...] = (1 / 16, 1 / 8, 1 / 4, 1 / 2, 1.0)
 
     @property
@@ -242,7 +244,9 @@ class BatchTopKTrainer:
                 fired = z.sum(0) > 0
                 self.inactive = torch.where(fired, torch.zeros_like(self.inactive), self.inactive + 1)
             l2 = (x_hat - x).pow(2).mean()
-            l1 = cfg.l1_coeff * z.abs().sum(-1).mean()
+            warm = cfg.l1_warmup_fraction * cfg.steps
+            l1_scale = min(1.0, step / warm) if warm > 0 else 1.0
+            l1 = cfg.l1_coeff * l1_scale * z.abs().sum(-1).mean()
             aux = torch.zeros((), device=dev)
             dead = self.inactive >= cfg.n_batches_to_dead
             n_dead = int(dead.sum())

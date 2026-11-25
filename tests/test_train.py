@@ -225,3 +225,16 @@ def test_full_k_encoding_is_the_relu_code() -> None:
                   torch.zeros(16), k=32)
     x = torch.randn(10, 16, generator=g)
     assert torch.equal(sae.encode(x), torch.relu(x @ sae.W_enc + sae.b_enc))
+
+
+def test_l1_warmup_scales_the_first_steps() -> None:
+    """With warm-up over all 50 steps, step 1 uses 1/50 of the coefficient: the same first step as a run with
+    that smaller coefficient and no warm-up."""
+    from medinterp.dictionaries.train import BatchTopKTrainer
+
+    warm = BatchTopKTrainer(_data(), TrainConfig(**SMALL, architecture="relu_l1", l1_coeff=0.5,
+                                                 l1_warmup_fraction=1.0), **quiet)
+    flat = BatchTopKTrainer(_data(), TrainConfig(**SMALL, architecture="relu_l1", l1_coeff=0.01), **quiet)
+    warm.run(until_step=1)
+    flat.run(until_step=1)
+    assert _equal_weights(warm.snapshot(), flat.snapshot())
