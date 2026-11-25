@@ -359,3 +359,17 @@ def test_phase_3_runs_pause_resume_and_save(tmp_path, architecture):
     cfg = json.loads((tmp_path / "full/toy_i0_b0/step_40/cfg.json").read_text())
     assert cfg["architecture"] == architecture
     assert a.k == (64 if architecture == "relu_l1" else 4)
+
+
+def test_relu_main_rows_follow_the_calibration():
+    from medinterp.sweep import RELU_L1_COEFFICIENTS, pick_l1_coefficients
+    import pandas as pd
+    full = sweep_table(full=True)
+    r = full[full.phase == "3r"]
+    assert list(r.index) == list(range(208, 228)) and set(r.architecture) == {"relu_l1"}
+    assert {(int(a), int(b)): float(c) for a, b, c in zip(r.d_sae, r.k, r.l1_coeff)} == RELU_L1_COEFFICIENTS
+    cal = pd.DataFrame({"d_sae": [1024] * 8 + [4096] * 8,
+                        "l1_coeff": [0.03, 0.0495, 0.0817, 0.135, 0.223, 0.367, 0.606, 1.0] * 2,
+                        "mean_l0": [123.4, 68.9, 41.4, 24.0, 11.9, 5.53, 2.18, 0.11,
+                                    227.2, 129.0, 65.8, 25.6, 10.8, 4.61, 1.95, 0.21]})
+    assert pick_l1_coefficients(cal) == RELU_L1_COEFFICIENTS

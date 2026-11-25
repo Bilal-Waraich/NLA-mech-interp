@@ -70,6 +70,9 @@ RELU_CALIBRATION_D_SAE = (1024, 4096)
 RELU_L1_GRID: tuple[float, ...] = tuple(float(f"{v:.3g}") for v in np.geomspace(0.03, 1.0, 8))
 # L1 warm-up of the ReLU+L1 runs (share of the steps), as in the standard ReLU+L1 recipe.
 RELU_L1_WARMUP_FRACTION = 0.05
+# Picked by the calibration rule (pick_l1_coefficients) from medinterp-sweep-3c-read, 2026-11-25; val mean L0
+# of the calibration runs: 5.5, 11.9, 24.0 and 25.6 (track A notes).
+RELU_L1_COEFFICIENTS = {(1024, 8): 0.367, (1024, 16): 0.223, (1024, 32): 0.135, (4096, 32): 0.135}
 
 # Settings carried forward, as (d_sae, k); roles and rules are in protocol section 5.
 CORE_SETTINGS = ((1024, 8), (1024, 16), (1024, 32), (4096, 32))
@@ -170,6 +173,8 @@ def sweep_table(full: bool = False) -> pd.DataFrame:
                 rows += [_row("2g", d_sae, k, s, s, steps=LONG_STEPS, checkpoints=LONG_CHECKPOINTS,
                               data_fraction=frac, variant=tag) for s in range(3)]
         rows += phase3_rows()
+        if RELU_L1_COEFFICIENTS:
+            rows += relu_main_rows(RELU_L1_COEFFICIENTS)
     table = pd.DataFrame(rows)
     table.insert(0, "row", np.arange(len(table)))
     if not table.run_id.is_unique:
