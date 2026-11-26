@@ -86,6 +86,8 @@ def main() -> None:
     if a.gpu:
         cmd += ["--accelerator", "NvidiaTeslaT4"]
     subprocess.run(cmd, check=True, env=kaggle_env(a.account))
+    # Every pushed run gets its row in results/run_index.csv at once (status is filled on the next full refresh).
+    subprocess.run([sys.executable, str(REPO / "scripts/run_index.py"), "--no-status"], check=False)
 
 
 if __name__ == "__main__":
