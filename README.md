@@ -14,8 +14,8 @@ frozen-decoder SAEs, PCA, and a random-weight copy of each encoder.
 
 It has two contributions, worked on in parallel:
 
-- **A. Universality under nulls**
-- **B. A natural-language autoencoder (NLA) for a medical vision encoder**
+- ** Universality under nulls**
+- ** Natural-language autoencoder (NLA) for a medical vision encoder**
 
 ## Research questions
 
@@ -29,7 +29,7 @@ It has two contributions, worked on in parallel:
    at a comparable budget? Are the claims it makes correct against labels and boxes?
 4. **RQ4 (universality in words).** Do explanations transfer, so that an NLA trained on one dataset or
    encoder reconstructs another? How does that compare with sharing at the feature level (RQ2)?
-5. **RQ5 (identifiability, pilot).** Can concepts be read from the encoder's own neurons in a way that
+5. **RQ5 (identifiability).** Can concepts be read from the encoder's own neurons in a way that
    reappears across fits more reliably than SAE latents reappear across seeds?
 
 ## Encoders and data
