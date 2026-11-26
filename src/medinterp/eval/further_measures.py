@@ -17,6 +17,8 @@ same code. Thresholds and definitions live in the protocol, not here.
 """
 from __future__ import annotations
 
+import sys
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -278,11 +280,21 @@ def _l1_logistic(C: float) -> LogisticRegression:
     return LogisticRegression(penalty="l1", solver="liblinear", C=C, class_weight="balanced", max_iter=2000)
 
 
-def _l1_probe(X_tr, y_tr, X_va, y_va):
+SLOW_FIT_SECONDS = 60.0
+
+
+def _l1_probe(X_tr, y_tr, X_va, y_va, label: str = ""):
     best = None
     for C in C_GRID:
         clf = make_pipeline(StandardScaler(), _l1_logistic(C))
+        start = time.perf_counter()
         clf.fit(X_tr, y_tr)
+        seconds = time.perf_counter() - start
+        # Single liblinear fits have taken hours on Kaggle (2026-11-26) and stalled whole evaluations; report
+        # the slow ones so the cause can be traced. Reporting only, the fit itself is unchanged.
+        if seconds > SLOW_FIT_SECONDS:
+            print(f"slow L1 fit {label} C={C}: {seconds:.0f} s, n_iter {clf[-1].n_iter_.max()}, X {X_tr.shape}, "
+                  f"constant columns {int((X_tr.std(axis=0) == 0).sum())}", file=sys.stderr, flush=True)
         a = roc_auc_score(y_va, clf.decision_function(X_va))
         if best is None or (a, C) > (best[0], best[1]):
             best = (a, C, clf)
@@ -309,7 +321,7 @@ def targeted_ablation(codes: dict[str, np.ndarray], targets: dict[str, dict[str,
         X_ev, y_ev = _stack(codes, targets[t], splits, eval_split)
         if min(len(np.unique(y_tr)), len(np.unique(y_va)), len(np.unique(y_ev))) < 2:
             continue
-        probes[t] = _l1_probe(X_tr, y_tr, X_va, y_va)
+        probes[t] = _l1_probe(X_tr, y_tr, X_va, y_va, label=f"ablation {t}")
         evals[t] = (X_ev, y_ev, float(roc_auc_score(y_ev, probes[t].decision_function(X_ev))))
     rows = []
     for conf in confounders:
