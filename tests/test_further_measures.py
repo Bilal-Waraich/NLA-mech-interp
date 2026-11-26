@@ -165,3 +165,22 @@ def test_recovery_mean_leaves_out_dataset_identity():
     rows = [{"target": "opacity_a", "recovered_share": 0.9}, {"target": "sex", "recovered_share": 0.7},
             {"target": "dataset_a", "recovered_share": -3.0}]
     assert se.recovery_mean(rows) == pytest.approx(0.8)
+
+
+def test_copy_saved_results_keeps_results_and_never_overwrites(tmp_path):
+    se = _sweep_eval()
+    earlier, out = tmp_path / "earlier", tmp_path / "out"
+    (earlier / "further").mkdir(parents=True)
+    (earlier / "cache/nulls").mkdir(parents=True)
+    (earlier / "further/d1024_k16_s80000.json").write_text("{}")
+    (earlier / "cache/nulls/d1024_k16.json").write_text('{"old": 1}')
+    (earlier / "config.json").write_text("{}")
+    (earlier / "run.log").write_text("log")
+    (out / "cache/nulls").mkdir(parents=True)
+    (out / "cache/nulls/d1024_k16.json").write_text('{"new": 1}')
+    assert se.copy_saved_results([earlier], out) == 1
+    assert (out / "further/d1024_k16_s80000.json").exists()
+    assert (out / "cache/nulls/d1024_k16.json").read_text() == '{"new": 1}'
+    assert not (out / "config.json").exists() and not (out / "run.log").exists()
+    with pytest.raises(SystemExit):
+        se.copy_saved_results([tmp_path / "missing"], out)

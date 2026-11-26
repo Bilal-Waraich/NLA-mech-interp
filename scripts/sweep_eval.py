@@ -440,6 +440,30 @@ def p11_architectures_table(fve: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def copy_saved_results(sources: list[Path], out: Path) -> int:
+    """Copy the result files of earlier evaluation folders into ``out`` so the caching rules skip them.
+
+    Only ``.json`` and ``.csv`` files are copied (logs and configs belong to the earlier run), and a file already in
+    ``out`` is never overwritten. Every result file is written whole after its computation, so a cut-off run leaves
+    no partial result behind. Returns the number of files copied; a missing source folder is an error.
+    """
+    copied = 0
+    for src in sources:
+        if not src.is_dir():
+            sys.exit(f"--resume-from: {src} is not a folder")
+        for f in src.rglob("*"):
+            rel = f.relative_to(src)
+            if not f.is_file() or f.suffix not in (".json", ".csv") or rel == Path("config.json"):
+                continue
+            dest = out / rel
+            if dest.exists():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(f.read_bytes())
+            copied += 1
+    return copied
+
+
 def further_dictionary(name: str, kind: str, enc, ctx, keep, probes: RecoveryProbes, targets, device: str) -> dict:
     """Performance recovery, absorption and targeted ablation of one dictionary (protocol section 4)."""
     feats = image_features(ctx.acts, enc, keep, device)
@@ -479,36 +503,43 @@ def run_further(settings: dict, ctx, device: str, out: Path, force: bool) -> Non
     done_nulls = set()
     for name, info in chosen.items():
         target_file = out / f"{name}.json"
-        if target_file.exists() and not force:
-            continue
-        runs = info["runs"]
-        step = max(set.intersection(*(set(r["steps"]) for r in runs.values())))
-        order = sorted(runs, key=lambda r: (runs[r]["init_seed"], runs[r]["data_seed"]))
-        saes = {r: TopKSAE.from_checkpoint(runs[r]["steps"][step]) for r in order}
-        result = {"setting": name, "d_sae": info["meta"]["d_sae"], "k": info["meta"]["k"], "step": step,
-                  "pairs": [], "dictionaries": []}
-        for i, a in enumerate(order):
-            for b in order[i + 1:]:
-                result["pairs"].append({"run_a": a, "run_b": b, **joint_seed_overlap(saes[a], saes[b], S_THRESHOLD)})
-        for r in order:
-            result["dictionaries"].append(further_dictionary(r, "trained", saes[r], ctx, keep, probes, targets, device))
-            d = result["dictionaries"][-1]
-            log(f"further {name} {r}: recovered share {d['mean_recovered_share']:.3f}")
-        target_file.write_text(json.dumps(result, indent=1, default=float))
+        # A saved setting file does not skip its nulls: a run cut off between the two (Kaggle's 12 h limit) must
+        # be able to resume with only the nulls left to compute.
+        if force or not target_file.exists():
+            runs = info["runs"]
+            step = max(set.intersection(*(set(r["steps"]) for r in runs.values())))
+            order = sorted(runs, key=lambda r: (runs[r]["init_seed"], runs[r]["data_seed"]))
+            saes = {r: TopKSAE.from_checkpoint(runs[r]["steps"][step]) for r in order}
+            result = {"setting": name, "d_sae": info["meta"]["d_sae"], "k": info["meta"]["k"], "step": step,
+                      "pairs": [], "dictionaries": []}
+            for i, a in enumerate(order):
+                for b in order[i + 1:]:
+                    result["pairs"].append({"run_a": a, "run_b": b,
+                                            **joint_seed_overlap(saes[a], saes[b], S_THRESHOLD)})
+            for r in order:
+                result["dictionaries"].append(further_dictionary(r, "trained", saes[r], ctx, keep, probes, targets,
+                                                                 device))
+                d = result["dictionaries"][-1]
+                log(f"further {name} {r}: recovered share {d['mean_recovered_share']:.3f}")
+            target_file.write_text(json.dumps(result, indent=1, default=float))
         # The matched nulls of this (d_sae, k), once per pair: the same measures under the same rules.
         key = (info["meta"]["d_sae"], info["meta"]["k"])
         null_file = out / f"nulls_d{key[0]}_k{key[1]}.json"
         if key in done_nulls or (null_file.exists() and not force):
             continue
         if pca_sample is None:
+            log("further nulls: sampling train tokens for signed PCA")
             pca_sample = train_token_sample(ctx, PCA_TOKENS_PER_DATASET, SEED)
         d_model = ctx.acts.d_model
         nulls = {f"random_seed{s}": random_sae(d_model, key[0], key[1], seed=s) for s in RANDOM_SAE_SEEDS}
         nulls["signed_pca"] = signed_pca(pca_sample, d_model, key[1])
         nulls["signed_basis"] = signed_basis(d_model, key[1])
-        null_result = {"d_sae": key[0], "k": key[1], "dictionaries": [
-            further_dictionary(n, "random_sae" if n.startswith("random") else n, enc, ctx, keep, probes, targets, device)
-            for n, enc in nulls.items()]}
+        null_result = {"d_sae": key[0], "k": key[1], "dictionaries": []}
+        for n, enc in nulls.items():
+            # One line per null so that a stalled run shows which dictionary it stopped in.
+            log(f"further nulls d{key[0]} k{key[1]}: starting {n}")
+            null_result["dictionaries"].append(further_dictionary(
+                n, "random_sae" if n.startswith("random") else n, enc, ctx, keep, probes, targets, device))
         null_file.write_text(json.dumps(null_result, indent=1, default=float))
         done_nulls.add(key)
         log(f"further nulls d{key[0]} k{key[1]}: recovered share "
@@ -663,12 +694,18 @@ def main() -> None:
     ap.add_argument("--skip-sweep-metrics", action="store_true",
                     help="skip the per-setting sweep metrics and their aggregation (with --per-latent or --probes)")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--resume-from", type=Path, nargs="*", default=[],
+                    help="earlier --out folders (e.g. a cut-off Kaggle run's eval/) whose saved results are copied "
+                         "into --out first, so only what they lack is computed")
     args = ap.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available()
                              else "mps" if torch.backends.mps.is_available() else "cpu")
     args.out.mkdir(parents=True, exist_ok=True)
+    copied = copy_saved_results(args.resume_from, args.out)
     LOG_FILE = open(args.out / "run.log", "a")
+    if args.resume_from:
+        log(f"resumed: {copied} saved result files copied from {[str(p) for p in args.resume_from]}")
     table = pd.read_csv(args.config)
     settings = collect_settings(table, args.runs, args.phase0_dir if args.phase0 else None)
     if args.settings:
